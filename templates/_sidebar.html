@@ -1,0 +1,24 @@
+<aside>
+  <div class="logo"><span>GG</span><strong>GreatGatsby</strong></div>
+  <div class="budget-name">{{ budget.name }}</div>
+  <nav>
+    <a class="{% if active_view == 'budget' %}active{% endif %}" href="{{ url_for('dashboard') }}">▦ Budget</a>
+    <a href="{{ url_for('dashboard') }}">⇄ All accounts</a>
+    <a class="{% if active_view == 'imports' %}active{% endif %}" href="{{ url_for('imports') }}">⌁ Import review</a>
+    <a class="{% if active_view == 'uncategorized' %}active{% endif %}" href="{{ url_for('uncategorized') }}">? Uncategorized {% if uncategorized_count %}<b>{{ uncategorized_count }}</b>{% endif %}</a>
+  </nav>
+  <p class="nav-label">ACCOUNTS</p>
+  {% for a in accounts %}
+  <a class="account {% if active_account_id == a.id %}active{% endif %}" href="{{ url_for('account_register', account_id=a.id) }}">
+    <span>{{ a.name }}</span><strong>{{ '${:,.2f}'.format(a.computed_balance/100) }}</strong>
+  </a>
+  {% else %}<p class="empty-side">Add your first account</p>{% endfor %}
+  {% if active_view == 'budget' %}
+  <button class="sidebar-action" onclick="openDialog('account-dialog')">＋ Add account</button>
+  <button class="sidebar-action" onclick="openDialog('transfer-dialog')">⇄ Transfer money</button>
+  {% else %}
+  <a class="sidebar-action" href="{{ url_for('dashboard', open='account') }}">＋ Add account</a>
+  <a class="sidebar-action" href="{{ url_for('dashboard', open='transfer') }}">⇄ Transfer money</a>
+  {% endif %}
+  <div class="sidebar-bottom"><span>{{ session.user_name or 'Owner' }}</span><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="link-button">Sign out</button></form></div>
+</aside>

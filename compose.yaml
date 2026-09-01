@@ -1,0 +1,14 @@
+services:
+  greatgatsby-budget:
+    build: .
+    image: ghcr.io/charliec94/greatgatsby-budget:0.1.0
+    container_name: greatgatsby-budget
+    ports:
+      - "8081:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-local-development-change-before-unraid}
+      APP_DATABASE: /data/greatgatsby.db
+    restart: unless-stopped
+

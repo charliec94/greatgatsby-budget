@@ -1,0 +1,11 @@
+{% extends 'base.html' %}{% block title %}Map statement · GreatGatsby Budget{% endblock %}{% block body %}
+<div class="app-shell">{% include '_sidebar.html' %}<main class="workspace import-page">
+<header><div><p class="eyebrow">STEP 2 OF 3</p><h1>Match your CSV columns.</h1></div></header>
+{% for category,message in get_flashed_messages(with_categories=true) %}<div class="flash {{category}}">{{message}}</div>{% endfor %}
+<section class="panel import-card"><div class="panel-title"><div><h2>{{batch.filename}}</h2><p>Choose the column that represents each field. Use Amount, or separate Outflow and Inflow columns.</p></div></div>
+<form method="post"><input type="hidden" name="csrf_token" value="{{csrf_token()}}">
+{% macro column_select(name,label,guess,required=false) %}<label>{{label}}<select name="{{name}}" {% if required %}required{% endif %}><option value="">Not used</option>{% for h in headers %}<option value="{{h}}" {% if h==guess %}selected{% endif %}>{{h}} — {{sample.get(h,'')|truncate(45)}}</option>{% endfor %}</select></label>{% endmacro %}
+{{column_select('date_column','Date',guesses.date,true)}}{{column_select('payee_column','Payee / description',guesses.payee,true)}}
+<div class="mapping-grid">{{column_select('amount_column','Single signed amount',guesses.amount)}}{{column_select('outflow_column','Outflow / debit',guesses.outflow)}}{{column_select('inflow_column','Inflow / credit',guesses.inflow)}}</div>
+{{column_select('memo_column','Memo (optional)',guesses.memo)}}<div class="dialog-actions"><a class="button-link secondary" href="{{url_for('imports')}}">Cancel</a><button>Review transactions</button></div></form></section>
+</main></div>{% endblock %}

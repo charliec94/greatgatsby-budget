@@ -1,0 +1,5 @@
+{% extends 'base.html' %}{% block title %}Sign in · GreatGatsby Budget{% endblock %}{% block body %}
+<main class="auth"><section class="auth-card"><div class="brand-mark">GG</div><p class="eyebrow">PRIVATE BY DESIGN</p><h1>Welcome back</h1><p class="muted">Sign in to GreatGatsby Budget.</p>
+{% for category,message in get_flashed_messages(with_categories=true) %}<div class="flash {{category}}">{{message}}</div>{% endfor %}
+<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label>Email<input name="email" type="email" required autocomplete="email"></label><label>Password<input name="password" type="password" required autocomplete="current-password"></label><button>Sign in</button></form></section></main>{% endblock %}
+
