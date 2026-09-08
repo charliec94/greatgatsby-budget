@@ -11,6 +11,7 @@ from pathlib import Path
 
 from flask import Flask, abort, flash, g, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
+from household_features import FEATURE_SCHEMA, register_features
 
 
 def create_app(test_config=None):
@@ -41,6 +42,7 @@ def create_app(test_config=None):
 
     def init_db():
         db().executescript(SCHEMA)
+        db().executescript(FEATURE_SCHEMA)
         needs_credit_rebuild = False
         columns = {row["name"] for row in db().execute("PRAGMA table_info(categories)")}
         if "hidden" not in columns:
@@ -95,6 +97,7 @@ def create_app(test_config=None):
         return session["csrf_token"]
 
     app.jinja_env.globals["csrf_token"] = csrf_token
+    app.jinja_env.filters["zip"] = zip
 
     @app.before_request
     def protect_csrf():
@@ -109,14 +112,30 @@ def create_app(test_config=None):
         def wrapped(**kwargs):
             if not session.get("user_id"):
                 return redirect(url_for("login"))
+            if not current_budget():
+                return redirect(url_for("budgets_page"))
             return view(**kwargs)
         return wrapped
 
     def current_budget():
-        return db().execute(
-            "SELECT * FROM budgets WHERE owner_id = ? ORDER BY id LIMIT 1",
-            (session["user_id"],),
-        ).fetchone()
+        budgets = db().execute(
+            """SELECT b.* FROM budgets b WHERE b.owner_id=? OR EXISTS
+               (SELECT 1 FROM budget_members m WHERE m.budget_id=b.id AND m.user_id=?) ORDER BY b.id""",
+            (session["user_id"], session["user_id"]),
+        ).fetchall()
+        chosen = next((b for b in budgets if b['id'] == session.get('budget_id')), budgets[0] if budgets else None)
+        if chosen:
+            session['budget_id'] = chosen['id']
+        return chosen
+
+    @app.context_processor
+    def budget_navigation():
+        if not session.get('user_id'):
+            return {'available_budgets': []}
+        budgets = db().execute('''SELECT b.* FROM budgets b WHERE b.owner_id=? OR EXISTS
+            (SELECT 1 FROM budget_members m WHERE m.budget_id=b.id AND m.user_id=?) ORDER BY b.name,b.id''',
+            (session['user_id'], session['user_id'])).fetchall()
+        return {'available_budgets': budgets}
 
     @app.context_processor
     def sidebar_counts():
@@ -131,7 +150,7 @@ def create_app(test_config=None):
                AND NOT EXISTS(SELECT 1 FROM transaction_splits s WHERE s.transaction_id=t.id)""",
             (budget["id"],),
         ).fetchone()[0]
-        return {"uncategorized_count": count}
+        return {"uncategorized_count": count, "is_budget_owner": budget["owner_id"] == session["user_id"]}
 
     def remember_payee_category(budget_id, payee, category_id):
         if not category_id or not payee.strip():
@@ -173,6 +192,25 @@ def create_app(test_config=None):
         if cleaned.startswith("(") and cleaned.endswith(")"):
             cleaned = f"-{cleaned[1:-1]}"
         return money(cleaned)
+
+    def import_header_signature(headers):
+        return json.dumps(sorted(header.strip().lower() for header in headers), separators=(",", ":"))
+
+    def parse_import_rows(batch_id, source_rows, headers, mapping):
+        date_column, payee_column = mapping.get("date_column"), mapping.get("payee_column")
+        amount_column, outflow_column, inflow_column = mapping.get("amount_column"), mapping.get("outflow_column"), mapping.get("inflow_column")
+        memo_column = mapping.get("memo_column")
+        if date_column not in headers or payee_column not in headers or not any(column in headers for column in (amount_column, outflow_column, inflow_column)):
+            return [], ["mapping"]
+        parsed, errors = [], []
+        for number, row in enumerate(source_rows, start=2):
+            try:
+                amount = parse_import_money(row.get(amount_column)) if amount_column in headers else parse_import_money(row.get(inflow_column)) - abs(parse_import_money(row.get(outflow_column)))
+                parsed.append((batch_id, parse_import_date(row.get(date_column)), (row.get(payee_column) or "Unknown")[:200],
+                               (row.get(memo_column) or "")[:500] if memo_column in headers else "", amount))
+            except (ValueError, TypeError):
+                errors.append(str(number))
+        return parsed, errors
 
     def target_metrics(target_type, target_amount, target_date, assigned, carried, activity, month):
         available = carried + assigned + activity
@@ -418,6 +456,8 @@ def create_app(test_config=None):
                                previous_month=previous_month, next_month=next_month,
                                show_hidden=show_hidden, hidden_count=sum(row["hidden"] for row in category_rows),
                                underfunded=sum(row["underfunded"] for row in category_rows if row["parent_id"]),
+                               entry_categories=spending_categories,
+                               payee_rules=db().execute("SELECT payee_key,display_name,category_id FROM payee_category_rules WHERE budget_id=? ORDER BY display_name", (budget["id"],)).fetchall(),
                                active_view="budget", active_account_id=None)
 
     @app.get("/accounts/<int:account_id>")
@@ -452,6 +492,22 @@ def create_app(test_config=None):
         splits = {}
         for split in split_rows:
             splits.setdefault(split["transaction_id"], []).append(split)
+        filters = {key: request.args.get(key, "").strip() for key in ("q", "start", "end", "category", "status", "direction", "sort")}
+        total_count = len(transactions)
+        def matches(item):
+            category = filters["category"]
+            return (not filters["q"] or filters["q"].casefold() in (item["payee"] + " " + item["memo"]).casefold()) and (
+                not filters["start"] or item["occurred_on"] >= filters["start"]) and (
+                not filters["end"] or item["occurred_on"] <= filters["end"]) and (
+                not filters["status"] or str(item["cleared"]) == filters["status"]) and (
+                not filters["direction"] or (item["amount_cents"] < 0 if filters["direction"] == "outflow" else item["amount_cents"] > 0)) and (
+                not category or (not item["category_id"] and not item["transfer_id"] and not item["split_count"] if category == "uncategorized" else
+                str(item["category_id"]) == category or any(str(s["category_id"]) == category for s in splits.get(item["id"], []))))
+        transactions = [item for item in transactions if matches(item)]
+        sort_fields = {"oldest": ("occurred_on", False), "payee": ("payee", False), "amount": ("amount_cents", False), "amount_desc": ("amount_cents", True)}
+        if filters["sort"] in sort_fields:
+            field, reverse = sort_fields[filters["sort"]]
+            transactions.sort(key=lambda item: (item[field].casefold() if field == "payee" else item[field], item["id"]), reverse=reverse)
         categories = db().execute(
             """SELECT c.id,c.name,p.name parent_name FROM categories c JOIN categories p ON p.id=c.parent_id
                WHERE c.budget_id=? AND c.kind='spending' AND c.hidden=0 ORDER BY p.name,c.name""",
@@ -469,14 +525,59 @@ def create_app(test_config=None):
         current_balance = account["starting_balance_cents"] + sum(row["amount_cents"] for row in rows)
         return render_template("account.html", budget=budget, account=account, transactions=transactions, categories=categories,
                                accounts=accounts, splits=splits, cleared_balance=cleared_balance, current_balance=current_balance,
-                               today=date.today(), active_view="account", active_account_id=account_id)
+                               today=date.today(), entry_categories=categories, filters=filters, total_count=total_count,
+                               payee_rules=db().execute("SELECT payee_key,display_name,category_id FROM payee_category_rules WHERE budget_id=? ORDER BY display_name", (budget["id"],)).fetchall(),
+                               transaction_account_id=account_id, active_view="account", active_account_id=account_id)
+
+    @app.post("/accounts/<int:account_id>/bulk")
+    @login_required
+    def account_bulk(account_id):
+        budget = current_budget()
+        if not db().execute("SELECT 1 FROM accounts WHERE id=? AND budget_id=?", (account_id, budget["id"])).fetchone():
+            abort(404)
+        action = request.form.get("action")
+        if action not in ("clear", "unclear", "categorize", "delete"):
+            abort(400)
+        category_id = request.form.get("category_id", type=int)
+        if action == "categorize" and not db().execute("SELECT 1 FROM categories WHERE id=? AND budget_id=? AND parent_id IS NOT NULL AND kind='spending'", (category_id, budget["id"])).fetchone():
+            flash("Choose a category for the selected transactions.", "error")
+            return redirect(url_for("account_register", account_id=account_id))
+        selected = {int(value) for value in request.form.getlist("selected") if value.isdigit()}
+        changed = skipped = 0
+        for transaction_id in selected:
+            row = db().execute("SELECT * FROM transactions WHERE id=? AND account_id=?", (transaction_id, account_id)).fetchone()
+            if not row or row["cleared"] == 2:
+                skipped += 1
+                continue
+            if action in ("clear", "unclear"):
+                db().execute("UPDATE transactions SET cleared=? WHERE id=?", (1 if action == "clear" else 0, transaction_id))
+            elif action == "categorize":
+                if row["transfer_id"] or db().execute("SELECT 1 FROM transaction_splits WHERE transaction_id=?", (transaction_id,)).fetchone():
+                    skipped += 1
+                    continue
+                db().execute("UPDATE transactions SET category_id=? WHERE id=?", (category_id, transaction_id))
+                remember_payee_category(budget["id"], row["payee"], category_id)
+            else:
+                # Transfers must be reviewed individually so the other account is not changed by a bulk delete.
+                if row["transfer_id"]:
+                    skipped += 1
+                    continue
+                db().execute("DELETE FROM category_activity WHERE transaction_id=?", (transaction_id,))
+                db().execute("DELETE FROM transaction_splits WHERE transaction_id=?", (transaction_id,))
+                db().execute("DELETE FROM transactions WHERE id=?", (transaction_id,))
+            changed += 1
+        rebuild_credit_activity(budget["id"])
+        db().commit()
+        flash(f"Updated {changed} transactions; skipped {skipped} protected or unsupported selections.", "success")
+        return redirect(url_for("account_register", account_id=account_id))
 
     @app.get("/imports")
     @login_required
     def imports():
         budget = current_budget()
         batches = db().execute("SELECT b.*,a.name account_name FROM import_batches b JOIN accounts a ON a.id=b.account_id WHERE b.budget_id=? ORDER BY b.id DESC LIMIT 10", (budget["id"],)).fetchall()
-        return render_template("imports.html", budget=budget, accounts=sidebar_accounts(budget["id"]), batches=batches,
+        mappings = db().execute("SELECT m.*,a.name account_name FROM saved_import_mappings m JOIN accounts a ON a.id=m.account_id WHERE m.budget_id=? ORDER BY a.name,m.name", (budget["id"],)).fetchall()
+        return render_template("imports.html", budget=budget, accounts=sidebar_accounts(budget["id"]), batches=batches, mappings=mappings,
                                active_view="imports", active_account_id=None)
 
     @app.get("/uncategorized")
@@ -600,8 +701,20 @@ def create_app(test_config=None):
             return redirect(url_for("imports"))
         cursor = db().execute("INSERT INTO import_batches(budget_id,account_id,filename,headers_json,rows_json,status) VALUES(?,?,?,?,?,'mapping')",
                               (budget["id"], account_id, uploaded.filename[:200], json.dumps(headers), json.dumps(rows[:5000])))
+        batch_id = cursor.lastrowid
+        saved_mapping = db().execute("SELECT * FROM saved_import_mappings WHERE budget_id=? AND account_id=? AND header_signature=?",
+                                     (budget["id"], account_id, import_header_signature(headers))).fetchone()
+        if saved_mapping:
+            parsed, errors = parse_import_rows(batch_id, rows[:5000], headers, json.loads(saved_mapping["mapping_json"]))
+            if not errors:
+                db().executemany("INSERT INTO import_rows(batch_id,occurred_on,payee,memo,amount_cents) VALUES(?,?,?,?,?)", parsed)
+                db().execute("UPDATE import_batches SET status='review' WHERE id=?", (batch_id,))
+                db().commit()
+                flash(f"Recognized the {saved_mapping['name']} import profile.", "success")
+                return redirect(url_for("review_import", batch_id=batch_id))
+            flash("The saved profile matched the columns, but some values could not be read. Please review the mapping.", "error")
         db().commit()
-        return redirect(url_for("map_import", batch_id=cursor.lastrowid))
+        return redirect(url_for("map_import", batch_id=batch_id))
 
     @app.route("/imports/<int:batch_id>/map", methods=("GET", "POST"))
     @login_required
@@ -613,33 +726,58 @@ def create_app(test_config=None):
         headers = json.loads(batch["headers_json"])
         source_rows = json.loads(batch["rows_json"])
         if request.method == "POST":
-            date_column, payee_column = request.form.get("date_column"), request.form.get("payee_column")
-            amount_column, outflow_column, inflow_column = request.form.get("amount_column"), request.form.get("outflow_column"), request.form.get("inflow_column")
-            memo_column = request.form.get("memo_column")
-            if date_column not in headers or payee_column not in headers or not any(column in headers for column in (amount_column, outflow_column, inflow_column)):
-                flash("Map the date, payee, and either amount or inflow/outflow columns.", "error")
+            mapping = {key: request.form.get(key) or "" for key in ("date_column", "payee_column", "amount_column", "outflow_column", "inflow_column", "memo_column")}
+            parsed, errors = parse_import_rows(batch_id, source_rows, headers, mapping)
+            if errors:
+                message = "Map the date, payee, and either amount or inflow/outflow columns." if errors == ["mapping"] else f"Could not read the date or amount on CSV row(s): {', '.join(errors[:8])}."
+                flash(message, "error")
             else:
-                parsed, errors = [], []
-                for number, row in enumerate(source_rows, start=2):
-                    try:
-                        amount = parse_import_money(row.get(amount_column)) if amount_column in headers else parse_import_money(row.get(inflow_column)) - abs(parse_import_money(row.get(outflow_column)))
-                        parsed.append((batch_id, parse_import_date(row.get(date_column)), (row.get(payee_column) or "Unknown")[:200],
-                                       (row.get(memo_column) or "")[:500] if memo_column in headers else "", amount))
-                    except (ValueError, TypeError):
-                        errors.append(str(number))
-                if errors:
-                    flash(f"Could not read the date or amount on CSV row(s): {', '.join(errors[:8])}.", "error")
-                else:
-                    db().execute("DELETE FROM import_rows WHERE batch_id=?", (batch_id,))
-                    db().executemany("INSERT INTO import_rows(batch_id,occurred_on,payee,memo,amount_cents) VALUES(?,?,?,?,?)", parsed)
-                    db().execute("UPDATE import_batches SET status='review' WHERE id=?", (batch_id,))
-                    db().commit()
-                    return redirect(url_for("review_import", batch_id=batch_id))
+                if request.form.get("save_mapping") == "1":
+                    profile_name = request.form.get("mapping_name", "").strip() or f"{batch['filename']} format"
+                    db().execute("""INSERT INTO saved_import_mappings(budget_id,account_id,name,header_signature,headers_json,mapping_json) VALUES(?,?,?,?,?,?)
+                        ON CONFLICT(account_id,header_signature) DO UPDATE SET name=excluded.name,headers_json=excluded.headers_json,mapping_json=excluded.mapping_json""",
+                        (budget["id"], batch["account_id"], profile_name[:100], import_header_signature(headers), json.dumps(headers), json.dumps(mapping)))
+                db().execute("DELETE FROM import_rows WHERE batch_id=?", (batch_id,))
+                db().executemany("INSERT INTO import_rows(batch_id,occurred_on,payee,memo,amount_cents) VALUES(?,?,?,?,?)", parsed)
+                db().execute("UPDATE import_batches SET status='review' WHERE id=?", (batch_id,))
+                db().commit()
+                return redirect(url_for("review_import", batch_id=batch_id))
         name_sets = {"date": ("date", "transaction date", "posted date"), "payee": ("payee", "description", "merchant", "name"), "amount": ("amount", "transaction amount"),
                      "outflow": ("outflow", "debit", "withdrawal"), "inflow": ("inflow", "credit", "deposit"), "memo": ("memo", "notes")}
         guesses = {field: next((header for header in headers if header.lower() in names), "") for field, names in name_sets.items()}
         return render_template("import_map.html", budget=budget, accounts=sidebar_accounts(budget["id"]), batch=batch, headers=headers,
                                sample=source_rows[0], guesses=guesses, active_view="imports", active_account_id=None)
+
+    @app.route("/import-mappings/<int:mapping_id>/edit", methods=("GET", "POST"))
+    @login_required
+    def edit_import_mapping(mapping_id):
+        budget = current_budget()
+        saved = db().execute("SELECT m.*,a.name account_name FROM saved_import_mappings m JOIN accounts a ON a.id=m.account_id WHERE m.id=? AND m.budget_id=?", (mapping_id, budget["id"])).fetchone()
+        if not saved:
+            abort(404)
+        headers = json.loads(saved["headers_json"])
+        mapping = json.loads(saved["mapping_json"])
+        if request.method == "POST":
+            updated = {key: request.form.get(key) or "" for key in ("date_column", "payee_column", "amount_column", "outflow_column", "inflow_column", "memo_column")}
+            if updated["date_column"] not in headers or updated["payee_column"] not in headers or not any(updated[key] in headers for key in ("amount_column", "outflow_column", "inflow_column")):
+                flash("Map the date, payee, and either amount or inflow/outflow columns.", "error")
+            else:
+                name = request.form.get("name", "").strip() or saved["name"]
+                db().execute("UPDATE saved_import_mappings SET name=?,mapping_json=? WHERE id=?", (name[:100], json.dumps(updated), mapping_id))
+                db().commit()
+                flash("Import profile updated.", "success")
+                return redirect(url_for("imports"))
+        return render_template("import_mapping_edit.html", budget=budget, accounts=sidebar_accounts(budget["id"]), saved=saved,
+                               headers=headers, mapping=mapping, active_view="imports", active_account_id=None)
+
+    @app.post("/import-mappings/<int:mapping_id>/delete")
+    @login_required
+    def delete_import_mapping(mapping_id):
+        budget = current_budget()
+        db().execute("DELETE FROM saved_import_mappings WHERE id=? AND budget_id=?", (mapping_id, budget["id"]))
+        db().commit()
+        flash("Import profile removed. Existing transactions were not changed.", "success")
+        return redirect(url_for("imports"))
 
     @app.get("/imports/<int:batch_id>/review")
     @login_required
@@ -896,11 +1034,17 @@ def create_app(test_config=None):
     @app.post("/transactions")
     @login_required
     def add_transaction():
-        amount = money(request.form.get("amount", "0"))
+        legacy_amount = request.form.get("amount")
+        outflow = abs(money(request.form.get("outflow", "0")))
+        inflow = abs(money(request.form.get("inflow", "0")))
+        amount = money(legacy_amount) if legacy_amount not in (None, "") else inflow - outflow
         account_id = request.form.get("account_id")
         payee = request.form.get("payee", "").strip()
-        if not account_id or not payee or amount == 0:
-            flash("Account, payee, and a non-zero amount are required.", "error")
+        return_account = request.form.get("return_account", type=int)
+        if legacy_amount in (None, "") and outflow and inflow:
+            flash("Enter either an outflow or an inflow, not both.", "error")
+        elif not account_id or not payee or amount == 0:
+            flash("Account, payee, and either an outflow or inflow are required.", "error")
         else:
             budget = current_budget()
             account = db().execute("SELECT * FROM accounts WHERE id=? AND budget_id=?", (account_id, budget["id"])).fetchone()
@@ -910,12 +1054,32 @@ def create_app(test_config=None):
                 abort(400, "Invalid account or category")
             occurred_on = request.form.get("occurred_on") or date.today().isoformat()
             datetime.strptime(occurred_on, "%Y-%m-%d")
-            db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared) VALUES(?,?,?,?,?,?,?)",
-                         (account_id, category_id, occurred_on, payee, request.form.get("memo", "").strip(), amount, 0))
+            is_split = request.form.get("is_split") == "1"
+            split_categories = request.form.getlist("split_category_id") if is_split else []
+            split_amounts = request.form.getlist("split_amount") if is_split else []
+            parsed_splits = []
+            if is_split:
+                for split_category, split_amount in zip(split_categories, split_amounts):
+                    split_value = abs(money(split_amount))
+                    valid_category = db().execute("SELECT 1 FROM categories WHERE id=? AND budget_id=? AND parent_id IS NOT NULL AND kind='spending'", (split_category, budget["id"])).fetchone()
+                    if split_value and valid_category:
+                        parsed_splits.append((int(split_category), split_value if amount > 0 else -split_value))
+                if len(parsed_splits) < 2 or sum(abs(value) for _, value in parsed_splits) != abs(amount):
+                    flash("Split amounts must use at least two categories and equal the transaction total.", "error")
+                    return redirect(url_for("account_register", account_id=return_account)) if return_account else redirect(url_for("dashboard"))
+                category_id = None
+            cleared = 1 if request.form.get("cleared") == "1" else 0
+            cursor = db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared) VALUES(?,?,?,?,?,?,?)",
+                                  (account_id, category_id, occurred_on, payee, request.form.get("memo", "").strip(), amount, cleared))
+            for split_category, split_value in parsed_splits:
+                db().execute("INSERT INTO transaction_splits(transaction_id,category_id,memo,amount_cents) VALUES(?,?,?,?)",
+                             (cursor.lastrowid, split_category, "", split_value))
+            if category_id:
+                remember_payee_category(budget["id"], payee, int(category_id))
             rebuild_credit_activity(budget["id"])
             db().commit()
             flash("Transaction added.", "success")
-        return redirect(url_for("dashboard"))
+        return redirect(url_for("account_register", account_id=return_account)) if return_account else redirect(url_for("dashboard"))
 
     @app.post("/transfers")
     @login_required
@@ -941,6 +1105,9 @@ def create_app(test_config=None):
         rebuild_credit_activity(budget["id"])
         db().commit()
         flash(f"Transferred ${amount/100:,.2f} from {by_id[source_id]['name']} to {by_id[target_id]['name']}.", "success")
+        return_account = request.form.get('return_account')
+        if return_account in by_id:
+            return redirect(url_for('account_register', account_id=return_account))
         return redirect(url_for("dashboard"))
 
     @app.post("/transactions/<int:transaction_id>/edit")
@@ -1140,6 +1307,7 @@ def create_app(test_config=None):
         return redirect(url_for("account_register", account_id=account_id))
 
     app.get_db = db
+    register_features(app, db, current_budget, login_required, sidebar_accounts)
     return app
 
 
@@ -1163,6 +1331,7 @@ CREATE TABLE IF NOT EXISTS import_batches(id INTEGER PRIMARY KEY, budget_id INTE
 CREATE TABLE IF NOT EXISTS import_rows(id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE, occurred_on TEXT NOT NULL, payee TEXT NOT NULL, memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS payee_category_rules(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), payee_key TEXT NOT NULL, display_name TEXT NOT NULL, category_id INTEGER NOT NULL REFERENCES categories(id), UNIQUE(budget_id,payee_key));
 CREATE TABLE IF NOT EXISTS category_targets(id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL UNIQUE REFERENCES categories(id) ON DELETE CASCADE, target_type TEXT NOT NULL, amount_cents INTEGER NOT NULL, target_date TEXT, due_day INTEGER);
+CREATE TABLE IF NOT EXISTS saved_import_mappings(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL, header_signature TEXT NOT NULL, headers_json TEXT NOT NULL, mapping_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(account_id,header_signature));
 """
 
 app = create_app()

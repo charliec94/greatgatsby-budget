@@ -10,5 +10,10 @@ services:
     environment:
       APP_SECRET_KEY: ${APP_SECRET_KEY:-local-development-change-before-unraid}
       APP_DATABASE: /data/greatgatsby.db
+      APP_BASE_URL: ${APP_BASE_URL:-}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
     restart: unless-stopped
-

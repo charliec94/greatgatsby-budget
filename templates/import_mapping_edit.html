@@ -1,0 +1,7 @@
+{% extends 'base.html' %}{% block title %}Edit import profile · GreatGatsby Budget{% endblock %}{% block body %}
+<div class="app-shell">{% include '_sidebar.html' %}<main class="workspace import-page"><header><div><p class="eyebrow">SAVED CSV FORMAT</p><h1>Edit import profile.</h1><p class="muted">{{saved.account_name}}</p></div></header>
+{% for category,message in get_flashed_messages(with_categories=true) %}<div class="flash {{category}}">{{message}}</div>{% endfor %}
+<section class="panel import-card"><form method="post"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><label>Profile name<input name="name" value="{{saved.name}}" required></label>
+{% macro profile_select(name,label) %}<label>{{label}}<select name="{{name}}"><option value="">Not used</option>{% for h in headers %}<option value="{{h}}" {% if mapping.get(name)==h %}selected{% endif %}>{{h}}</option>{% endfor %}</select></label>{% endmacro %}
+{{profile_select('date_column','Date')}}{{profile_select('payee_column','Payee / description')}}<div class="mapping-grid">{{profile_select('amount_column','Single signed amount')}}{{profile_select('outflow_column','Outflow / debit')}}{{profile_select('inflow_column','Inflow / credit')}}</div>{{profile_select('memo_column','Memo (optional)')}}
+<div class="dialog-actions"><a class="button-link secondary" href="{{url_for('imports')}}">Cancel</a><button>Save profile</button></div></form></section></main></div>{% endblock %}

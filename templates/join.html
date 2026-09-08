@@ -1,0 +1,4 @@
+{% extends 'base.html' %}{% block title %}Join household · GreatGatsby{% endblock %}{% block body %}
+<main class="auth"><section class="auth-card"><h1>Join the household</h1><p>Invitation for {{invite.email}}. Members can view and edit the shared budget.</p>
+{% for category,message in get_flashed_messages(with_categories=true) %}<div class="flash {{category}}">{{message}}</div>{% endfor %}
+<form method="post"><input type="hidden" name="csrf_token" value="{{csrf_token()}}">{% if not existing %}<label>Your name<input name="name" required maxlength="100"></label>{% endif %}<label>{{'Your existing GreatGatsby password' if existing else 'Create a password (at least 10 characters)'}}<input name="password" type="password" required minlength="10" autocomplete="{{'current-password' if existing else 'new-password'}}"></label><button>Accept invitation</button></form></section></main>{% endblock %}

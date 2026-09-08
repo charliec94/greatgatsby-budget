@@ -1,24 +1,23 @@
-<aside>
-  <div class="logo"><span>GG</span><strong>GreatGatsby</strong></div>
-  <div class="budget-name">{{ budget.name }}</div>
-  <nav>
-    <a class="{% if active_view == 'budget' %}active{% endif %}" href="{{ url_for('dashboard') }}">▦ Budget</a>
-    <a href="{{ url_for('dashboard') }}">⇄ All accounts</a>
-    <a class="{% if active_view == 'imports' %}active{% endif %}" href="{{ url_for('imports') }}">⌁ Import review</a>
-    <a class="{% if active_view == 'uncategorized' %}active{% endif %}" href="{{ url_for('uncategorized') }}">? Uncategorized {% if uncategorized_count %}<b>{{ uncategorized_count }}</b>{% endif %}</a>
+{% macro icon(name) %}<svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{% if name=='budget' %}<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M3 9h18M8 14h3m4 0h1"/>{% elif name=='reports' %}<path d="M4 3v17h17M9 15v-4m5 4V7m5 8V4"/>{% elif name=='imports' %}<path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5"/>{% elif name=='inbox' %}<path d="m3 13 3-8h12l3 8v7H3zM3 13h5l2 3h4l2-3h5"/>{% elif name=='household' %}<circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2m1-14a3 3 0 0 1 0 6m2 3a4 4 0 0 1 3 4"/>{% elif name=='backup' %}<path d="M4 10a8 8 0 1 1 1 8M4 4v6h6m2-3v6l4 2"/>{% else %}<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M3 10h18m-5 5h2"/>{% endif %}</svg>{% endmacro %}
+<aside id="app-sidebar" aria-label="Main navigation">
+  <div class="logo"><span>GG</span><strong>GreatGatsby<small>BUDGET</small></strong></div>
+  <details class="budget-picker"><summary><span>{{budget.name if budget else 'Choose a budget'}}</span><span aria-hidden="true">⌄</span></summary><div class="budget-picker-menu">
+    {% for b in available_budgets %}<form method="post" action="{{url_for('switch_budget',budget_id=b.id)}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><button class="{{'selected-budget' if budget and budget.id==b.id else ''}}">{{b.name}}</button></form>{% endfor %}
+    <button type="button" onclick="document.getElementById('new-budget-dialog').showModal()">＋ New budget</button>
+    <a href="{{url_for('budgets_page')}}">Manage budgets</a>
+    {% if is_budget_owner %}<button type="button" class="danger" onclick="document.getElementById('delete-budget-dialog').showModal()">Delete this budget…</button>{% endif %}
+  </div></details>
+  {% if budget %}<nav aria-label="Budget navigation">
+    <a class="{{'active' if active_view=='budget' else ''}}" href="{{url_for('dashboard')}}">{{icon('budget')}}<span>Budget</span></a>
+    <a class="{{'active' if active_view=='reports' else ''}}" href="{{url_for('reports')}}">{{icon('reports')}}<span>Reports</span></a>
+    <a class="{{'active' if active_view=='imports' else ''}}" href="{{url_for('imports')}}">{{icon('imports')}}<span>Import review</span></a>
+    <a class="{{'active' if active_view=='uncategorized' else ''}}" href="{{url_for('uncategorized')}}">{{icon('inbox')}}<span>Uncategorized</span>{% if uncategorized_count %}<b>{{uncategorized_count}}</b>{% endif %}</a>
+    {% if is_budget_owner %}<a class="{{'active' if active_view=='backups' else ''}}" href="{{url_for('backups')}}">{{icon('backup')}}<span>Backup &amp; restore</span></a><a class="{{'active' if active_view=='household' else ''}}" href="{{url_for('household')}}">{{icon('household')}}<span>Household</span></a>{% endif %}
   </nav>
   <p class="nav-label">ACCOUNTS</p>
-  {% for a in accounts %}
-  <a class="account {% if active_account_id == a.id %}active{% endif %}" href="{{ url_for('account_register', account_id=a.id) }}">
-    <span>{{ a.name }}</span><strong>{{ '${:,.2f}'.format(a.computed_balance/100) }}</strong>
-  </a>
-  {% else %}<p class="empty-side">Add your first account</p>{% endfor %}
-  {% if active_view == 'budget' %}
-  <button class="sidebar-action" onclick="openDialog('account-dialog')">＋ Add account</button>
-  <button class="sidebar-action" onclick="openDialog('transfer-dialog')">⇄ Transfer money</button>
-  {% else %}
-  <a class="sidebar-action" href="{{ url_for('dashboard', open='account') }}">＋ Add account</a>
-  <a class="sidebar-action" href="{{ url_for('dashboard', open='transfer') }}">⇄ Transfer money</a>
-  {% endif %}
-  <div class="sidebar-bottom"><span>{{ session.user_name or 'Owner' }}</span><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="link-button">Sign out</button></form></div>
+  {% for a in accounts %}<a class="account {{'active' if active_account_id==a.id else ''}}" href="{{url_for('account_register',account_id=a.id)}}">{{icon('account')}}<span>{{a.name}}</span><strong>{{'${:,.2f}'.format(a.computed_balance/100)}}</strong></a>{% else %}<p class="empty-side">Add your first account</p>{% endfor %}
+  {% if active_view=='budget' %}<button class="sidebar-action" onclick="openDialog('account-dialog')">＋ Add account</button>{% else %}<a class="sidebar-action" href="{{url_for('dashboard',open='account')}}">＋ Add account</a>{% endif %}{% endif %}
+  <div class="sidebar-bottom"><span>{{session.user_name or 'Owner'}}</span><form method="post" action="{{url_for('logout')}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><button class="link-button">Sign out</button></form></div>
 </aside>
+<dialog id="new-budget-dialog"><form method="post" action="{{url_for('create_budget')}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><h2>New budget</h2><p class="muted">A separate plan with its own accounts, categories, targets, and household access.</p><label>Budget name<input name="name" maxlength="100" required placeholder="Household, Travel, Side business…"></label><div class="dialog-actions"><button type="button" class="outline" onclick="this.closest('dialog').close()">Cancel</button><button>Create budget</button></div></form></dialog>
+{% if is_budget_owner %}<dialog id="delete-budget-dialog"><form method="post" action="{{url_for('delete_budget',budget_id=budget.id)}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><h2>Delete {{budget.name}}?</h2><p class="muted">This removes its accounts, transactions, categories, targets, and household access. Other budgets are unchanged. A financial recovery copy is saved in data/backups first.</p><label>Type the exact budget name<input name="confirm_name" required autocomplete="off"></label><label>Your password<input type="password" name="password" required autocomplete="current-password"></label><div class="dialog-actions"><button type="button" class="outline" onclick="this.closest('dialog').close()">Cancel</button><button class="danger-button">Delete budget</button></div></form></dialog>{% endif %}

@@ -105,6 +105,45 @@ def test_targets_progress_and_fund_underfunded_stops_at_zero(tmp_path):
     connection.close()
 
 
+def test_improved_transaction_entry_outflow_inflow_and_creation_split(tmp_path):
+    client = make_client(tmp_path)
+    client.post("/setup", data={"csrf_token": token(client), "name": "Charlie", "email": "charlie@example.com", "password": "a-strong-password"})
+    csrf = token(client, "/")
+    client.post("/accounts", data={"csrf_token": csrf, "name": "Checking", "type": "checking", "balance": "1000"})
+    client.post("/categories", data={"csrf_token": csrf, "name": "Everyday", "month": "2026-09"})
+    connection = sqlite3.connect(tmp_path / "test.db")
+    account_id = connection.execute("SELECT id FROM accounts WHERE name='Checking'").fetchone()[0]
+    group_id = connection.execute("SELECT id FROM categories WHERE name='Everyday'").fetchone()[0]
+    connection.close()
+    for name in ("Groceries", "Household"):
+        client.post("/categories", data={"csrf_token": csrf, "name": name, "parent_id": group_id, "month": "2026-09"})
+    connection = sqlite3.connect(tmp_path / "test.db")
+    grocery_id = connection.execute("SELECT id FROM categories WHERE name='Groceries'").fetchone()[0]
+    household_id = connection.execute("SELECT id FROM categories WHERE name='Household'").fetchone()[0]
+    connection.close()
+    register = client.get(f"/accounts/{account_id}")
+    assert b"Add transaction to Checking" in register.data and b"Outflow" in register.data and b"Inflow" in register.data
+    saved = client.post("/transactions", data={"csrf_token": csrf, "account_id": account_id, "return_account": account_id,
+        "occurred_on": "2026-09-10", "payee": "Market", "outflow": "25.50", "inflow": "", "category_id": grocery_id,
+        "cleared": "1"}, follow_redirects=True)
+    assert b"Transaction added" in saved.data
+    client.post("/transactions", data={"csrf_token": csrf, "account_id": account_id, "occurred_on": "2026-09-11",
+        "payee": "Employer", "outflow": "", "inflow": "500", "cleared": "0"})
+    client.post("/transactions", data={"csrf_token": csrf, "account_id": account_id, "occurred_on": "2026-09-12",
+        "payee": "Superstore", "outflow": "60", "inflow": "", "is_split": "1",
+        "split_category_id": [str(grocery_id), str(household_id)], "split_amount": ["40", "20"]})
+    connection = sqlite3.connect(tmp_path / "test.db")
+    assert connection.execute("SELECT amount_cents,cleared,category_id FROM transactions WHERE payee='Market'").fetchone() == (-2550, 1, grocery_id)
+    assert connection.execute("SELECT amount_cents FROM transactions WHERE payee='Employer'").fetchone()[0] == 50000
+    split_transaction = connection.execute("SELECT id,amount_cents,category_id FROM transactions WHERE payee='Superstore'").fetchone()
+    assert split_transaction[1:] == (-6000, None)
+    assert [row[0] for row in connection.execute("SELECT amount_cents FROM transaction_splits WHERE transaction_id=? ORDER BY id", (split_transaction[0],))] == [-4000, -2000]
+    assert connection.execute("SELECT category_id FROM payee_category_rules WHERE payee_key='market'").fetchone()[0] == grocery_id
+    connection.close()
+    rejected = client.post("/transactions", data={"csrf_token": csrf, "account_id": account_id, "payee": "Bad entry", "outflow": "5", "inflow": "5"}, follow_redirects=True)
+    assert b"either an outflow or an inflow" in rejected.data
+
+
 def test_imported_credit_card_payment_matching_and_missing_side(tmp_path):
     client = make_client(tmp_path)
     client.post("/setup", data={"csrf_token": token(client), "name": "Charlie", "email": "charlie@example.com", "password": "a-strong-password"})
@@ -161,12 +200,22 @@ def test_csv_import_mapping_review_and_commit(tmp_path):
     assert upload.status_code == 302 and "/map" in upload.location
     batch_id = int(upload.location.split("/")[-2])
     mapped = client.post(f"/imports/{batch_id}/map", data={"csrf_token": csrf, "date_column": "Date", "payee_column": "Description",
-        "amount_column": "Amount", "memo_column": "Memo"}, follow_redirects=True)
+        "amount_column": "Amount", "memo_column": "Memo", "save_mapping": "1", "mapping_name": "Checking CSV"}, follow_redirects=True)
     assert b"Review before importing" in mapped.data and b"42.15" in mapped.data and b"$500.00" in mapped.data
     connection = sqlite3.connect(tmp_path / "test.db")
+    mapping_id = connection.execute("SELECT id FROM saved_import_mappings WHERE name='Checking CSV'").fetchone()[0]
     grocery_id = connection.execute("SELECT id FROM categories WHERE name='Groceries'").fetchone()[0]
     import_rows = connection.execute("SELECT id,payee FROM import_rows ORDER BY id").fetchall()
     connection.close()
+    recognized = client.post("/imports/upload", data={"csrf_token": csrf, "account_id": str(account_id),
+        "statement": (io.BytesIO(b"Date,Description,Amount,Memo\n09/03/2026,Cafe,-8.00,Coffee\n"), "new-statement.csv")},
+        content_type="multipart/form-data", follow_redirects=True)
+    assert b"Recognized the Checking CSV import profile" in recognized.data and b"Review before importing" in recognized.data
+    profiles = client.get("/imports")
+    assert b"Checking CSV" in profiles.data and b"Saved import profiles" in profiles.data
+    renamed = client.post(f"/import-mappings/{mapping_id}/edit", data={"csrf_token": csrf, "name": "Main Checking",
+        "date_column": "Date", "payee_column": "Description", "amount_column": "Amount", "memo_column": "Memo"}, follow_redirects=True)
+    assert b"Main Checking" in renamed.data
     selected = [str(row[0]) for row in import_rows]
     committed = client.post(f"/imports/{batch_id}/commit", data={"csrf_token": csrf, "selected": selected}, follow_redirects=True)
     assert b"Imported 2 transactions" in committed.data
@@ -188,13 +237,15 @@ def test_csv_import_mapping_review_and_commit(tmp_path):
     connection.close()
     inbox = client.get("/uncategorized")
     assert b"Everyday" in inbox.data and b"Groceries" in inbox.data
-    assert b"Uncategorized <b>2</b>" in inbox.data
+    assert b"Uncategorized</span><b>2</b>" in inbox.data
     assigned = client.post("/uncategorized/assign", data={"csrf_token": csrf, "selected": str(new_transaction_id),
         "category_id": str(grocery_id)}, follow_redirects=True)
     assert b"Categorized 1 transaction" in assigned.data
     connection = sqlite3.connect(tmp_path / "test.db")
     assert connection.execute("SELECT category_id FROM transactions WHERE id=?", (new_transaction_id,)).fetchone()[0] == grocery_id
     connection.close()
+    removed = client.post(f"/import-mappings/{mapping_id}/delete", data={"csrf_token": csrf}, follow_redirects=True)
+    assert b"Import profile removed" in removed.data
 
 
 def test_move_money_move_category_and_delete(tmp_path):

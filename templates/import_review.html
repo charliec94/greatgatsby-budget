@@ -1,6 +1,7 @@
 {% extends 'base.html' %}{% block title %}Review import · GreatGatsby Budget{% endblock %}{% block body %}
 <div class="app-shell">{% include '_sidebar.html' %}<main class="workspace import-page">
 <header><div><p class="eyebrow">STEP 3 OF 3</p><h1>Review before importing.</h1><p class="muted">{{batch.filename}} → {{batch.account_name}}. Categories are optional—you can assign them later from the account.</p></div></header>
+{% for category,message in get_flashed_messages(with_categories=true) %}<div class="flash {{category}}">{{message}}</div>{% endfor %}
 <form method="post" action="{{url_for('commit_import',batch_id=batch.id)}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}">
 <section class="panel import-review"><div class="review-toolbar"><label><input id="select-all" type="checkbox"> Select all non-duplicates</label><span><b id="selected-count">0</b> selected</span></div>
 <div class="import-row import-head"><span>Import</span><span>Date</span><span>Payee</span><span>Category</span><span>Amount</span></div>

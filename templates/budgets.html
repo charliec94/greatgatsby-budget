@@ -1,0 +1,6 @@
+{% extends 'base.html' %}{% block title %}Your budgets · GreatGatsby{% endblock %}{% block body %}
+<div class="app-shell">{% include '_sidebar.html' %}<main class="workspace"><p class="eyebrow">YOUR PLANS</p><h1>Your budgets</h1>
+{% for category,message in get_flashed_messages(with_categories=true) %}<div class="flash {{category}}">{{message}}</div>{% endfor %}
+<p class="muted budget-intro">Keep separate plans without mixing accounts or money. Use the budget menu in the sidebar to switch or delete a budget you own.</p>
+<div class="budget-cards">{% for b in available_budgets %}<section class="panel budget-card"><span class="eyebrow">{{'Owner' if b.owner_id==session.user_id else 'Member'}}</span><h2>{{b.name}}</h2><form method="post" action="{{url_for('switch_budget',budget_id=b.id)}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><button>Open budget</button></form></section>{% else %}<section class="panel budget-card"><h2>A fresh start</h2><p>No budgets available. Create one to get started, or accept a household invitation.</p></section>{% endfor %}</div>
+<button type="button" onclick="document.getElementById('new-budget-dialog').showModal()">＋ Create budget</button></main></div>{% endblock %}

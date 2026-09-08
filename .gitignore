@@ -3,5 +3,6 @@ __pycache__/
 .venv/
 data/*.db
 data/*.db-*
+data/backups/
 .env
 work/
