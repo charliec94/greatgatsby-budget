@@ -89,3 +89,15 @@ docker push ghcr.io/charliec94/greatgatsby-budget:0.1.0
 ```
 
 For Unraid, map host port `8081` to container port `8000` and map `/mnt/user/appdata/greatgatsby-budget` to `/data`.
+
+### Per-container Tailscale on Unraid
+
+Use bridge networking and set the Unraid WebUI field to `http://[IP]:[PORT:8000]`. Enable Tailscale Serve with a unique hostname, target the app's internal HTTP port `8000`, set the state directory to `/data/.tailscale_state`, and leave Funnel disabled. The normal LAN URL uses host port `8081`; the private Tailscale HTTPS URL does not.
+
+For the Unraid container icon, use:
+
+```text
+https://raw.githubusercontent.com/charliec94/greatgatsby-budget/main/assets/greatgatsby-budget-icon.png
+```
+
+The image runs as the non-root `app` user by default. If Unraid's Tailscale hook reports that it lacks root privileges, set the container's Extra Parameters to `--user 0`. After applying the template, verify `docker exec YNAB tailscale serve status`. If it reports `No serve config`, run `docker exec -u 0 YNAB tailscale serve --bg http://127.0.0.1:8000` once.
