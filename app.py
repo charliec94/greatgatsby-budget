@@ -263,6 +263,45 @@ def create_app(test_config=None):
             (category_id, month_key, category_id, cutoff, category_id, cutoff, category_id, cutoff),
         ).fetchone()[0]
 
+    def ready_to_assign_for_month(budget_id, month, next_month):
+        """Return unassigned cash through the end of the selected budget month."""
+        balances = db().execute(
+            """SELECT COALESCE((SELECT SUM(assigned_cents) FROM category_assignments
+                                  WHERE category_id=c.id AND month<=?),0)
+                      + COALESCE((SELECT SUM(amount_cents) FROM transactions
+                                  WHERE category_id=c.id AND occurred_on<?),0)
+                      + COALESCE((SELECT SUM(s.amount_cents) FROM transaction_splits s
+                                  JOIN transactions t ON t.id=s.transaction_id
+                                  WHERE s.category_id=c.id AND t.occurred_on<?),0)
+                      + COALESCE((SELECT SUM(amount_cents) FROM category_activity
+                                  WHERE category_id=c.id AND occurred_on<?),0) balance
+               FROM categories c WHERE c.budget_id=? AND c.parent_id IS NOT NULL""",
+            (month.strftime("%Y-%m"), next_month.isoformat(), next_month.isoformat(), next_month.isoformat(), budget_id),
+        ).fetchall()
+        available = sum(max(row["balance"], 0) for row in balances)
+        cash = db().execute(
+            """SELECT COALESCE(SUM(a.starting_balance_cents + COALESCE((SELECT SUM(amount_cents)
+                       FROM transactions WHERE account_id=a.id AND occurred_on<?),0)),0)
+               FROM accounts a WHERE a.budget_id=? AND a.type!='credit'""",
+            (next_month.isoformat(), budget_id),
+        ).fetchone()[0]
+        return cash - available
+
+    def category_balance_for_month(category_id, month, next_month):
+        return db().execute(
+            """SELECT COALESCE((SELECT SUM(assigned_cents) FROM category_assignments
+                                  WHERE category_id=? AND month<=?),0)
+                      + COALESCE((SELECT SUM(amount_cents) FROM transactions
+                                  WHERE category_id=? AND occurred_on<?),0)
+                      + COALESCE((SELECT SUM(s.amount_cents) FROM transaction_splits s
+                                  JOIN transactions t ON t.id=s.transaction_id
+                                  WHERE s.category_id=? AND t.occurred_on<?),0)
+                      + COALESCE((SELECT SUM(amount_cents) FROM category_activity
+                                  WHERE category_id=? AND occurred_on<?),0)""",
+            (category_id, month.strftime("%Y-%m"), category_id, next_month.isoformat(),
+             category_id, next_month.isoformat(), category_id, next_month.isoformat()),
+        ).fetchone()[0]
+
     def payment_category(account_id):
         return db().execute("SELECT * FROM categories WHERE credit_account_id=? AND kind='credit_payment'", (account_id,)).fetchone()
 
@@ -468,13 +507,7 @@ def create_app(test_config=None):
         activity = sum(row["activity"] for row in category_rows if row["parent_id"])
         category_balances = [row["carried"] + row["assigned"] + row["activity"] for row in category_rows if row["parent_id"]]
         available = sum(max(balance, 0) for balance in category_balances)
-        cash_balance = db().execute(
-            """SELECT COALESCE(SUM(a.starting_balance_cents + COALESCE((SELECT SUM(t.amount_cents)
-                       FROM transactions t WHERE t.account_id=a.id AND t.occurred_on<?),0)),0)
-               FROM accounts a WHERE a.budget_id=? AND a.type!='credit'""",
-            (next_month.isoformat(), budget["id"]),
-        ).fetchone()[0]
-        ready_to_assign = cash_balance - available
+        ready_to_assign = ready_to_assign_for_month(budget["id"], month, next_month)
         for row in category_rows:
             row["quick_fund"] = min(row["underfunded"], max(ready_to_assign, 0))
         return render_template("dashboard.html", budget=budget, accounts=accounts, groups=groups,
@@ -1033,6 +1066,66 @@ def create_app(test_config=None):
         db().commit()
         flash(f"Updated {category['name']} for {month.strftime('%B %Y')}.", "success")
         return redirect(url_for("dashboard", month=month.strftime("%Y-%m"), show_hidden=request.form.get("show_hidden") or None))
+
+    @app.post("/ready-to-assign/assign")
+    @login_required
+    def assign_ready_money():
+        budget = current_budget()
+        month, _, next_month = selected_month(request.form.get("month"))
+        category_id = request.form.get("category_id", type=int)
+        amount = money(request.form.get("amount", "0"))
+        category = db().execute(
+            "SELECT * FROM categories WHERE id=? AND budget_id=? AND parent_id IS NOT NULL AND hidden=0",
+            (category_id, budget["id"]),
+        ).fetchone()
+        ready = ready_to_assign_for_month(budget["id"], month, next_month)
+        if not category or amount <= 0:
+            flash("Choose a category and enter a positive amount.", "error")
+        elif amount > ready:
+            flash(f"Only ${max(ready, 0)/100:,.2f} is currently Ready to Assign.", "error")
+        else:
+            db().execute(
+                """INSERT INTO category_assignments(category_id,month,assigned_cents) VALUES(?,?,?)
+                   ON CONFLICT(category_id,month) DO UPDATE SET assigned_cents=assigned_cents+excluded.assigned_cents""",
+                (category_id, month.strftime("%Y-%m"), amount),
+            )
+            log_money_move(db(), budget["id"], session["user_id"], month.strftime("%Y-%m"),
+                           f"Assigned Ready to Assign money to {category['name']}",
+                           [{"category_id": category_id, "delta": amount}])
+            db().commit()
+            flash(f"Assigned ${amount/100:,.2f} to {category['name']}.", "success")
+        return redirect(url_for("dashboard", month=month.strftime("%Y-%m")))
+
+    @app.post("/categories/<int:category_id>/cover-overspending")
+    @login_required
+    def cover_category_overspending(category_id):
+        budget = current_budget()
+        month, _, next_month = selected_month(request.form.get("month"))
+        category = db().execute(
+            "SELECT * FROM categories WHERE id=? AND budget_id=? AND parent_id IS NOT NULL AND hidden=0",
+            (category_id, budget["id"]),
+        ).fetchone()
+        if not category:
+            abort(404)
+        balance = category_balance_for_month(category_id, month, next_month)
+        needed = max(-balance, 0)
+        ready = ready_to_assign_for_month(budget["id"], month, next_month)
+        if not needed:
+            flash(f"{category['name']} is not overspent.", "error")
+        elif ready < needed:
+            flash(f"Covering {category['name']} requires ${needed/100:,.2f}, but only ${max(ready, 0)/100:,.2f} is Ready to Assign.", "error")
+        else:
+            db().execute(
+                """INSERT INTO category_assignments(category_id,month,assigned_cents) VALUES(?,?,?)
+                   ON CONFLICT(category_id,month) DO UPDATE SET assigned_cents=assigned_cents+excluded.assigned_cents""",
+                (category_id, month.strftime("%Y-%m"), needed),
+            )
+            log_money_move(db(), budget["id"], session["user_id"], month.strftime("%Y-%m"),
+                           f"Covered {category['name']} overspending from Ready to Assign",
+                           [{"category_id": category_id, "delta": needed}])
+            db().commit()
+            flash(f"Covered ${needed/100:,.2f} of overspending in {category['name']}.", "success")
+        return redirect(url_for("dashboard", month=month.strftime("%Y-%m")))
 
     @app.post("/categories/<int:category_id>/target")
     @login_required

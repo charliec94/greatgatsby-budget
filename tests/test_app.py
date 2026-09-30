@@ -71,6 +71,43 @@ def test_group_cannot_receive_assignment(tmp_path):
     assert response.status_code == 400
 
 
+def test_ready_to_assign_picker_and_cover_overspending(tmp_path):
+    client = make_client(tmp_path)
+    client.post("/setup", data={"csrf_token": token(client), "name": "Charlie", "email": "charlie@example.com", "password": "a-strong-password"})
+    csrf = token(client, "/")
+    client.post("/accounts", data={"csrf_token": csrf, "name": "Checking", "type": "checking", "balance": "1000"})
+    client.post("/categories", data={"csrf_token": csrf, "name": "Living", "month": "2026-09"})
+    connection = sqlite3.connect(tmp_path / "test.db")
+    account_id = connection.execute("SELECT id FROM accounts WHERE name='Checking'").fetchone()[0]
+    group_id = connection.execute("SELECT id FROM categories WHERE name='Living'").fetchone()[0]
+    connection.close()
+    client.post("/categories", data={"csrf_token": csrf, "name": "Groceries", "parent_id": group_id, "month": "2026-09"})
+    connection = sqlite3.connect(tmp_path / "test.db")
+    category_id = connection.execute("SELECT id FROM categories WHERE name='Groceries'").fetchone()[0]
+    connection.close()
+    client.post("/transactions", data={"csrf_token": csrf, "account_id": account_id, "category_id": category_id,
+        "occurred_on": "2026-09-05", "payee": "Market", "amount": "-100"})
+
+    dashboard = client.get("/?month=2026-09")
+    assert b"Choose category" in dashboard.data
+    assert b"Cover $100.00 from Ready to Assign" in dashboard.data
+    covered = client.post(f"/categories/{category_id}/cover-overspending", data={"csrf_token": csrf, "month": "2026-09"}, follow_redirects=True)
+    assert b"Covered $100.00 of overspending" in covered.data
+
+    assigned = client.post("/ready-to-assign/assign", data={"csrf_token": csrf, "month": "2026-09",
+        "category_id": category_id, "amount": "200"}, follow_redirects=True)
+    assert b"Assigned $200.00 to Groceries" in assigned.data
+    assert b"$700.00" in assigned.data
+    rejected = client.post("/ready-to-assign/assign", data={"csrf_token": csrf, "month": "2026-09",
+        "category_id": category_id, "amount": "800"}, follow_redirects=True)
+    assert b"Only $700.00 is currently Ready to Assign" in rejected.data
+
+    connection = sqlite3.connect(tmp_path / "test.db")
+    assert connection.execute("SELECT assigned_cents FROM category_assignments WHERE category_id=? AND month='2026-09'", (category_id,)).fetchone()[0] == 30000
+    assert connection.execute("SELECT COUNT(*) FROM money_moves").fetchone()[0] == 2
+    connection.close()
+
+
 def test_targets_progress_and_fund_underfunded_stops_at_zero(tmp_path):
     client = make_client(tmp_path)
     client.post("/setup", data={"csrf_token": token(client), "name": "Charlie", "email": "charlie@example.com", "password": "a-strong-password"})
