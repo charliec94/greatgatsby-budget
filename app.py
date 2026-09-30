@@ -63,6 +63,18 @@ def create_app(test_config=None):
         if "transfer_id" not in transaction_columns:
             db().execute("ALTER TABLE transactions ADD COLUMN transfer_id TEXT")
             needs_credit_rebuild = True
+        if "ready_to_assign" not in transaction_columns:
+            db().execute("ALTER TABLE transactions ADD COLUMN ready_to_assign INTEGER NOT NULL DEFAULT 0")
+        import_row_columns = {row["name"] for row in db().execute("PRAGMA table_info(import_rows)")}
+        if "review_selected" not in import_row_columns:
+            db().execute("ALTER TABLE import_rows ADD COLUMN review_selected INTEGER")
+        if "review_category" not in import_row_columns:
+            db().execute("ALTER TABLE import_rows ADD COLUMN review_category TEXT")
+        if "imported" not in import_row_columns:
+            db().execute("ALTER TABLE import_rows ADD COLUMN imported INTEGER NOT NULL DEFAULT 0")
+            # Older versions only recorded completion on the whole statement. Reopen those
+            # reviews and let exact duplicate detection identify rows already committed.
+            db().execute("UPDATE import_batches SET status='partial' WHERE status='imported'")
         db().execute(
             """INSERT OR IGNORE INTO category_assignments(category_id,month,assigned_cents)
                SELECT id, strftime('%Y-%m','now'), assigned_cents FROM categories
@@ -146,7 +158,7 @@ def create_app(test_config=None):
             return {"uncategorized_count": 0}
         count = db().execute(
             """SELECT COUNT(*) FROM transactions t JOIN accounts a ON a.id=t.account_id
-               WHERE a.budget_id=? AND t.category_id IS NULL AND t.transfer_id IS NULL
+               WHERE a.budget_id=? AND t.category_id IS NULL AND t.transfer_id IS NULL AND t.ready_to_assign=0
                AND NOT EXISTS(SELECT 1 FROM transaction_splits s WHERE s.transaction_id=t.id)""",
             (budget["id"],),
         ).fetchone()[0]
@@ -501,7 +513,7 @@ def create_app(test_config=None):
                 not filters["end"] or item["occurred_on"] <= filters["end"]) and (
                 not filters["status"] or str(item["cleared"]) == filters["status"]) and (
                 not filters["direction"] or (item["amount_cents"] < 0 if filters["direction"] == "outflow" else item["amount_cents"] > 0)) and (
-                not category or (not item["category_id"] and not item["transfer_id"] and not item["split_count"] if category == "uncategorized" else
+                not category or (not item["category_id"] and not item["transfer_id"] and not item["split_count"] and not item["ready_to_assign"] if category == "uncategorized" else
                 str(item["category_id"]) == category or any(str(s["category_id"]) == category for s in splits.get(item["id"], []))))
         transactions = [item for item in transactions if matches(item)]
         sort_fields = {"oldest": ("occurred_on", False), "payee": ("payee", False), "amount": ("amount_cents", False), "amount_desc": ("amount_cents", True)}
@@ -555,7 +567,7 @@ def create_app(test_config=None):
                 if row["transfer_id"] or db().execute("SELECT 1 FROM transaction_splits WHERE transaction_id=?", (transaction_id,)).fetchone():
                     skipped += 1
                     continue
-                db().execute("UPDATE transactions SET category_id=? WHERE id=?", (category_id, transaction_id))
+                db().execute("UPDATE transactions SET category_id=?,ready_to_assign=0 WHERE id=?", (category_id, transaction_id))
                 remember_payee_category(budget["id"], row["payee"], category_id)
             else:
                 # Transfers must be reviewed individually so the other account is not changed by a bulk delete.
@@ -589,7 +601,7 @@ def create_app(test_config=None):
                FROM transactions t JOIN accounts a ON a.id=t.account_id
                LEFT JOIN payee_category_rules r ON r.budget_id=a.budget_id AND r.payee_key=lower(trim(t.payee))
                LEFT JOIN categories c ON c.id=r.category_id LEFT JOIN categories p ON p.id=c.parent_id
-               WHERE a.budget_id=? AND t.category_id IS NULL AND t.transfer_id IS NULL
+               WHERE a.budget_id=? AND t.category_id IS NULL AND t.transfer_id IS NULL AND t.ready_to_assign=0
                AND NOT EXISTS(SELECT 1 FROM transaction_splits s WHERE s.transaction_id=t.id)
                ORDER BY t.occurred_on DESC,t.id DESC""", (budget["id"],)
         ).fetchall()
@@ -622,7 +634,7 @@ def create_app(test_config=None):
                 WHERE t.id=? AND a.budget_id=? AND t.category_id IS NULL AND t.transfer_id IS NULL AND t.cleared!=2
                 AND NOT EXISTS(SELECT 1 FROM transaction_splits s WHERE s.transaction_id=t.id)""", (transaction_id, budget["id"])).fetchone()
             if transaction:
-                db().execute("UPDATE transactions SET category_id=? WHERE id=?", (category_id, transaction_id))
+                db().execute("UPDATE transactions SET category_id=?,ready_to_assign=0 WHERE id=?", (category_id, transaction_id))
                 remember_payee_category(budget["id"], transaction["payee"], category_id)
                 updated += 1
         rebuild_credit_activity(budget["id"])
@@ -786,16 +798,54 @@ def create_app(test_config=None):
         batch = db().execute("SELECT b.*,a.name account_name FROM import_batches b JOIN accounts a ON a.id=b.account_id WHERE b.id=? AND b.budget_id=?", (batch_id, budget["id"])).fetchone()
         if not batch:
             abort(404)
-        rows = db().execute("""SELECT r.*,EXISTS(SELECT 1 FROM transactions t WHERE t.account_id=b.account_id AND t.occurred_on=r.occurred_on
+        raw_rows = db().execute("""SELECT r.*,EXISTS(SELECT 1 FROM transactions t WHERE t.account_id=b.account_id AND t.occurred_on=r.occurred_on
             AND t.amount_cents=r.amount_cents AND lower(t.payee)=lower(r.payee)) duplicate,pr.category_id suggested_category_id,
             c.name suggested_category_name,p.name suggested_parent_name FROM import_rows r JOIN import_batches b ON b.id=r.batch_id
             LEFT JOIN payee_category_rules pr ON pr.budget_id=b.budget_id AND pr.payee_key=lower(trim(r.payee))
             LEFT JOIN categories c ON c.id=pr.category_id LEFT JOIN categories p ON p.id=c.parent_id
             WHERE r.batch_id=? ORDER BY r.occurred_on,r.id""", (batch_id,)).fetchall()
+        rows = []
+        for raw in raw_rows:
+            row = dict(raw)
+            row["selected"] = bool(row["review_selected"]) if row["review_selected"] is not None else not bool(row["duplicate"])
+            if row["review_category"] is not None:
+                row["category_choice"] = row["review_category"]
+            elif row["suggested_category_id"]:
+                row["category_choice"] = str(row["suggested_category_id"])
+            elif row["amount_cents"] > 0:
+                row["category_choice"] = "ready_to_assign"
+            else:
+                row["category_choice"] = ""
+            rows.append(row)
         categories = db().execute("""SELECT c.id,c.name,p.name parent_name FROM categories c JOIN categories p ON p.id=c.parent_id
             WHERE c.budget_id=? AND c.kind='spending' AND c.hidden=0 ORDER BY p.name,c.name""", (budget["id"],)).fetchall()
         return render_template("import_review.html", budget=budget, accounts=sidebar_accounts(budget["id"]), batch=batch,
                                rows=rows, categories=categories, active_view="imports", active_account_id=None)
+
+    @app.post("/imports/<int:batch_id>/autosave")
+    @login_required
+    def autosave_import_review(batch_id):
+        budget = current_budget()
+        row_id = request.form.get("row_id", type=int)
+        row = db().execute("""SELECT r.* FROM import_rows r JOIN import_batches b ON b.id=r.batch_id
+            WHERE r.id=? AND r.batch_id=? AND b.budget_id=?""", (row_id, batch_id, budget["id"])).fetchone()
+        if not row:
+            abort(404)
+        if row["imported"]:
+            return ("", 204)
+        choice = request.form.get("category", "")
+        if choice == "ready_to_assign":
+            if row["amount_cents"] <= 0:
+                abort(400, "Ready to Assign is only available for inflows")
+        elif choice and (not choice.isdigit() or not db().execute(
+            "SELECT 1 FROM categories WHERE id=? AND budget_id=? AND parent_id IS NOT NULL AND kind='spending'",
+            (int(choice), budget["id"]),
+        ).fetchone()):
+            abort(400, "Invalid category")
+        selected = 1 if request.form.get("selected") == "1" else 0
+        db().execute("UPDATE import_rows SET review_selected=?,review_category=? WHERE id=?", (selected, choice, row_id))
+        db().commit()
+        return ("", 204)
 
     @app.post("/imports/<int:batch_id>/commit")
     @login_required
@@ -804,26 +854,46 @@ def create_app(test_config=None):
         batch = db().execute("SELECT * FROM import_batches WHERE id=? AND budget_id=?", (batch_id, budget["id"])).fetchone()
         if not batch:
             abort(404)
-        if batch["status"] == "imported":
-            flash("This statement has already been imported.", "error")
-            return redirect(url_for("account_register", account_id=batch["account_id"]))
         selected = {int(value) for value in request.form.getlist("selected") if value.isdigit()}
+        pending_rows = db().execute("SELECT * FROM import_rows WHERE batch_id=? AND imported=0", (batch_id,)).fetchall()
+        for row in pending_rows:
+            choice = request.form.get(f"category_{row['id']}")
+            if choice is None:
+                choice = row["review_category"]
+            db().execute("UPDATE import_rows SET review_selected=?,review_category=? WHERE id=?",
+                         (1 if row["id"] in selected else 0, choice if choice is not None else "", row["id"]))
+        if not selected.intersection({row["id"] for row in pending_rows}):
+            db().commit()
+            flash("Select at least one remaining transaction to import.", "error")
+            return redirect(url_for("review_import", batch_id=batch_id))
         imported = 0
-        for row in db().execute("SELECT * FROM import_rows WHERE batch_id=?", (batch_id,)).fetchall():
+        for row in pending_rows:
             if row["id"] not in selected:
                 continue
-            category_id = request.form.get(f"category_{row['id']}", type=int)
+            choice = request.form.get(f"category_{row['id']}")
+            if choice is None:
+                choice = row["review_category"] or ""
+            if choice == "ready_to_assign" and row["amount_cents"] <= 0:
+                abort(400, "Ready to Assign is only available for inflows")
+            if choice and choice != "ready_to_assign" and not choice.isdigit():
+                abort(400, "Invalid category")
+            category_id = int(choice) if choice.isdigit() else None
             valid = category_id and db().execute("SELECT 1 FROM categories WHERE id=? AND budget_id=? AND parent_id IS NOT NULL AND kind='spending'", (category_id, budget["id"])).fetchone()
-            db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared) VALUES(?,?,?,?,?,?,0)",
-                         (batch["account_id"], category_id if valid else None, row["occurred_on"], row["payee"], row["memo"], row["amount_cents"]))
+            if category_id and not valid:
+                abort(400, "Invalid category")
+            ready_to_assign = 1 if choice == "ready_to_assign" and row["amount_cents"] > 0 else 0
+            db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,ready_to_assign) VALUES(?,?,?,?,?,?,0,?)",
+                         (batch["account_id"], category_id if valid else None, row["occurred_on"], row["payee"], row["memo"], row["amount_cents"], ready_to_assign))
             if valid:
                 remember_payee_category(budget["id"], row["payee"], category_id)
+            db().execute("UPDATE import_rows SET imported=1,review_selected=0,review_category=? WHERE id=?", (choice, row["id"]))
             imported += 1
-        db().execute("UPDATE import_batches SET status='imported' WHERE id=?", (batch_id,))
+        remaining = db().execute("SELECT COUNT(*) FROM import_rows WHERE batch_id=? AND imported=0", (batch_id,)).fetchone()[0]
+        db().execute("UPDATE import_batches SET status=? WHERE id=?", ("partial" if remaining else "imported", batch_id))
         rebuild_credit_activity(budget["id"])
         db().commit()
         flash(f"Imported {imported} transaction{'s' if imported != 1 else ''}.", "success")
-        return redirect(url_for("account_register", account_id=batch["account_id"]))
+        return redirect(url_for("review_import", batch_id=batch_id)) if remaining else redirect(url_for("account_register", account_id=batch["account_id"]))
 
     @app.post("/accounts")
     @login_required
@@ -1143,11 +1213,17 @@ def create_app(test_config=None):
         else:
             amount = money(request.form.get("amount", "0"))
             split = db().execute("SELECT COUNT(*) count,COALESCE(SUM(amount_cents),0) total FROM transaction_splits WHERE transaction_id=?", (transaction_id,)).fetchone()
-            category_id = None if split["count"] else request.form.get("category_id") or None
+            category_choice = "" if split["count"] else request.form.get("category_id", "")
+            ready_to_assign = bool(category_choice == "ready_to_assign" and amount > 0)
+            category_id = int(category_choice) if category_choice.isdigit() else None
             if amount == 0:
                 flash("Transaction amount cannot be zero.", "error")
             elif split["count"] and amount != split["total"]:
                 flash("Edit the split lines before changing the total transaction amount.", "error")
+            elif category_choice == "ready_to_assign" and amount <= 0:
+                flash("Ready to Assign is only available for inflows.", "error")
+            elif category_choice and category_choice != "ready_to_assign" and not category_choice.isdigit():
+                abort(400, "Invalid category")
             elif category_id and not db().execute(
                 "SELECT 1 FROM categories WHERE id=? AND budget_id=? AND kind='spending' AND parent_id IS NOT NULL",
                 (category_id, budget["id"]),
@@ -1155,9 +1231,9 @@ def create_app(test_config=None):
                 abort(400, "Invalid category")
             else:
                 db().execute(
-                    "UPDATE transactions SET occurred_on=?,payee=?,memo=?,amount_cents=?,category_id=?,cleared=? WHERE id=?",
+                    "UPDATE transactions SET occurred_on=?,payee=?,memo=?,amount_cents=?,category_id=?,cleared=?,ready_to_assign=? WHERE id=?",
                     (occurred_on, request.form.get("payee", "").strip(), request.form.get("memo", "").strip(),
-                     amount, category_id, status, transaction_id),
+                     amount, category_id, status, 1 if ready_to_assign else 0, transaction_id),
                 )
                 if category_id:
                     remember_payee_category(budget["id"], request.form.get("payee", "").strip(), int(category_id))
@@ -1180,13 +1256,19 @@ def create_app(test_config=None):
         if transaction["cleared"] == 2 or transaction["transfer_id"] or transaction["split_count"]:
             flash("That transaction cannot be categorized directly.", "error")
             return redirect(url_for("account_register", account_id=transaction["account_id"]))
-        category_id = request.form.get("category_id", type=int)
+        category_choice = request.form.get("category_id", "")
+        ready_to_assign = category_choice == "ready_to_assign" and transaction["amount_cents"] > 0
+        if category_choice == "ready_to_assign" and transaction["amount_cents"] <= 0:
+            abort(400, "Ready to Assign is only available for inflows")
+        if category_choice and category_choice != "ready_to_assign" and not category_choice.isdigit():
+            abort(400, "Invalid category")
+        category_id = int(category_choice) if category_choice.isdigit() else None
         if category_id and not db().execute(
             "SELECT 1 FROM categories WHERE id=? AND budget_id=? AND kind='spending' AND parent_id IS NOT NULL",
             (category_id, budget["id"]),
         ).fetchone():
             abort(400, "Invalid category")
-        db().execute("UPDATE transactions SET category_id=? WHERE id=?", (category_id, transaction_id))
+        db().execute("UPDATE transactions SET category_id=?,ready_to_assign=? WHERE id=?", (category_id, 1 if ready_to_assign else 0, transaction_id))
         if category_id:
             remember_payee_category(budget["id"], transaction["payee"], category_id)
         rebuild_credit_activity(budget["id"])
@@ -1258,7 +1340,7 @@ def create_app(test_config=None):
         for category_id, amount, memo in lines:
             db().execute("INSERT INTO transaction_splits(transaction_id,category_id,memo,amount_cents) VALUES(?,?,?,?)",
                          (transaction_id, category_id, memo, amount))
-        db().execute("UPDATE transactions SET category_id=NULL WHERE id=?", (transaction_id,))
+        db().execute("UPDATE transactions SET category_id=NULL,ready_to_assign=0 WHERE id=?", (transaction_id,))
         rebuild_credit_activity(budget["id"])
         db().commit()
         flash("Transaction split updated and envelope balances recalculated.", "success")
@@ -1324,11 +1406,11 @@ CREATE TABLE IF NOT EXISTS budgets(id INTEGER PRIMARY KEY, owner_id INTEGER NOT 
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), name TEXT NOT NULL, type TEXT NOT NULL, balance_cents INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), parent_id INTEGER REFERENCES categories(id), name TEXT NOT NULL, assigned_cents INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS category_assignments(id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL REFERENCES categories(id), month TEXT NOT NULL, assigned_cents INTEGER NOT NULL DEFAULT 0, UNIQUE(category_id,month));
-CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id), category_id INTEGER REFERENCES categories(id), occurred_on TEXT NOT NULL, payee TEXT NOT NULL, memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL, cleared INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id), category_id INTEGER REFERENCES categories(id), occurred_on TEXT NOT NULL, payee TEXT NOT NULL, memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL, cleared INTEGER NOT NULL DEFAULT 0, ready_to_assign INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS category_activity(id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL REFERENCES categories(id), transaction_id INTEGER REFERENCES transactions(id), occurred_on TEXT NOT NULL, amount_cents INTEGER NOT NULL, kind TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS transaction_splits(id INTEGER PRIMARY KEY, transaction_id INTEGER NOT NULL REFERENCES transactions(id), category_id INTEGER NOT NULL REFERENCES categories(id), memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS import_batches(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), account_id INTEGER NOT NULL REFERENCES accounts(id), filename TEXT NOT NULL, headers_json TEXT NOT NULL, rows_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'mapping', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS import_rows(id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE, occurred_on TEXT NOT NULL, payee TEXT NOT NULL, memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS import_rows(id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE, occurred_on TEXT NOT NULL, payee TEXT NOT NULL, memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL, review_selected INTEGER, review_category TEXT, imported INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS payee_category_rules(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), payee_key TEXT NOT NULL, display_name TEXT NOT NULL, category_id INTEGER NOT NULL REFERENCES categories(id), UNIQUE(budget_id,payee_key));
 CREATE TABLE IF NOT EXISTS category_targets(id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL UNIQUE REFERENCES categories(id) ON DELETE CASCADE, target_type TEXT NOT NULL, amount_cents INTEGER NOT NULL, target_date TEXT, due_day INTEGER);
 CREATE TABLE IF NOT EXISTS saved_import_mappings(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL, header_signature TEXT NOT NULL, headers_json TEXT NOT NULL, mapping_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(account_id,header_signature));
