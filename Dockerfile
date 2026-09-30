@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py ./
 COPY household_features.py ./
 COPY budget_backup.py ./
+COPY planning_features.py ./
 COPY templates ./templates
 COPY static ./static
 

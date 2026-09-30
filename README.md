@@ -8,9 +8,11 @@ A private, local-first household budgeting application inspired by envelope budg
 - Monthly assignments move cash into category envelopes; unused Available balances carry forward.
 - Account balances are derived from starting balances plus their transaction ledgers.
 - Account transfers create linked, equal-and-opposite transactions and are not spending.
+- Statement review suggests transfer matches across accounts when the amounts are opposite and the dates are within three days. Confirming the suggestion links both legs instead of counting either one as income or spending; if the other statement draft has not been imported yet, the review shows a waiting hint.
 - Funded credit-card spending automatically reserves cash in the card's payment envelope.
 - Unfunded credit-card spending creates debt without creating payment cash.
 - Credit-card payments are transfers from a cash account to the card and reduce the payment envelope.
+- Positive imports may be sent to Ready to Assign only in cash accounts. Credit-card inflows must be handled as payments/transfers or refunds, preventing card payments from inflating income.
 
 ## Account registers
 
@@ -43,7 +45,10 @@ For anything beyond temporary laptop testing, copy `.env.example` to `.env` and 
 ## Reports, backups, and household access
 
 - **Reports** provides spending by group/subcategory, monthly income versus net spending, and date/account filters. Linked transfers and credit-card payments are excluded; split purchases are counted once. Uncategorized inflows are treated as income and categorized inflows as refunds. Unmatched payment imports must be linked first. Refunds can produce negative net spending.
-- **Backup & restore** is owner-only. Download a versioned JSON financial backup and store it somewhere secure/off the NAS. It includes import drafts and financial information in plain text, but no login passwords, memberships, invitation tokens, or email credentials. It is not a full installation backup. On a new installation, create an owner first and restore the financial backup; invite members again.
+- **Planning tools** provides weekly, biweekly, and monthly scheduled transactions, personal custom Focused Views, and a Recent Money Moves ledger with compensating undo. Due schedules enter the account register once and then advance to their next date.
+- **Auto-Assign** always presents a preview. It prioritizes overspending, upcoming scheduled outflows, and targets, and never assigns more than Ready to Assign.
+- **Reconciliation** records statement dates and balances, locks cleared transactions through that date, and optionally creates an explicit balance-adjustment transaction. Import rows on or before the last reconciliation start unchecked.
+- **Backup & restore** is owner-only. Download a versioned JSON financial backup and store it somewhere secure/off the NAS. It includes scheduled transactions, reconciliation history, money moves, import drafts, and financial information in plain text, but no login passwords, memberships, invitation tokens, personal Focused Views, or email credentials. It is not a full installation backup. On a new installation, create an owner first and restore the financial backup; invite members again.
 - Restore accepts backups up to 5 MB, requires the owner password and typing `RESTORE`, validates in an isolated database, then replaces financial data in a transaction. A mandatory pre-restore copy is saved under `data/backups` (or `/data/backups` in Docker). These recovery files are excluded from Git and the image; keep additional off-device backups yourself. Household access and SMTP settings are preserved. Only use trusted backups from this app version.
 - **Household** is owner-only. Members have shared read/write access to the budget and reports, not invitations or backup/restore. Removing a member blocks their next budget request. Links expire after seven days and can only be accepted once. Reissuing an invite for the same address revokes earlier pending links.
 - An email address identifies the member; this does not implement Google sign-in. New members create a local password. Existing accounts must supply their existing password. Copyable invitation links work with no email setup and no internet connection.

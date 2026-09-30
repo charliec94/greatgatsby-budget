@@ -3,9 +3,11 @@ import json
 import sqlite3
 from datetime import date, datetime, timezone
 
-TABLES = ('accounts', 'categories', 'category_assignments', 'transactions', 'transaction_splits',
-          'category_activity', 'import_batches', 'import_rows', 'payee_category_rules', 'category_targets', 'saved_import_mappings')
-DIRECT = {'accounts', 'categories', 'import_batches', 'payee_category_rules', 'saved_import_mappings'}
+LEGACY_TABLES = ('accounts', 'categories', 'category_assignments', 'transactions', 'transaction_splits',
+                 'category_activity', 'import_batches', 'import_rows', 'payee_category_rules', 'category_targets', 'saved_import_mappings')
+TABLES = LEGACY_TABLES + ('scheduled_transactions', 'scheduled_occurrences', 'account_reconciliations', 'money_moves')
+DIRECT = {'accounts', 'categories', 'import_batches', 'payee_category_rules', 'saved_import_mappings',
+          'scheduled_transactions', 'account_reconciliations', 'money_moves'}
 PARENTS = {
     'categories': {'parent_id': 'categories', 'credit_account_id': 'accounts'},
     'category_assignments': {'category_id': 'categories'},
@@ -15,7 +17,22 @@ PARENTS = {
     'import_batches': {'account_id': 'accounts'}, 'import_rows': {'batch_id': 'import_batches'},
     'payee_category_rules': {'category_id': 'categories'}, 'category_targets': {'category_id': 'categories'},
     'saved_import_mappings': {'account_id': 'accounts'},
+    'scheduled_transactions': {'account_id': 'accounts', 'category_id': 'categories'},
+    'scheduled_occurrences': {'schedule_id': 'scheduled_transactions', 'transaction_id': 'transactions'},
+    'account_reconciliations': {'account_id': 'accounts', 'adjustment_transaction_id': 'transactions'},
 }
+
+
+def normalize(payload):
+    """Allow core-only version 1 backups while writing complete version 2 backups."""
+    if isinstance(payload, dict) and payload.get('version') == 1 and isinstance(payload.get('tables'), dict):
+        if set(payload['tables']) == set(LEGACY_TABLES):
+            payload = dict(payload)
+            payload['tables'] = dict(payload['tables'])
+            for table in TABLES[len(LEGACY_TABLES):]:
+                payload['tables'][table] = []
+            payload['version'] = 2
+    return payload
 
 
 def snapshot(connection, budget_id):
@@ -30,15 +47,21 @@ def snapshot(connection, budget_id):
             predicate = 'transaction_id IN (SELECT t.id FROM transactions t JOIN accounts a ON a.id=t.account_id WHERE a.budget_id=?)'
         elif table == 'import_rows':
             predicate = 'batch_id IN (SELECT id FROM import_batches WHERE budget_id=?)'
+        elif table == 'scheduled_occurrences':
+            predicate = 'schedule_id IN (SELECT id FROM scheduled_transactions WHERE budget_id=?)'
         else:
             predicate = 'category_id IN (SELECT id FROM categories WHERE budget_id=?)'
         data[table] = [dict(row) for row in connection.execute(f'SELECT * FROM {table} WHERE {predicate}', (budget_id,))]
-    return dict(format='greatgatsby-budget', version=1, created_at=datetime.now(timezone.utc).isoformat(),
+        if table in ('account_reconciliations', 'money_moves'):
+            for row in data[table]:
+                row['user_id'] = None
+    return dict(format='greatgatsby-budget', version=2, created_at=datetime.now(timezone.utc).isoformat(),
                 budget=dict(name=budget['name'], currency=budget['currency']), tables=data)
 
 
 def validate(connection, payload):
-    if not isinstance(payload, dict) or payload.get('format') != 'greatgatsby-budget' or payload.get('version') != 1:
+    payload = normalize(payload)
+    if not isinstance(payload, dict) or payload.get('format') != 'greatgatsby-budget' or payload.get('version') != 2:
         raise ValueError('Not a supported GreatGatsby backup.')
     tables = payload.get('tables')
     if not isinstance(tables, dict) or set(tables) != set(TABLES):
@@ -89,6 +112,18 @@ def validate(connection, payload):
             if table == 'saved_import_mappings':
                 if not isinstance(json.loads(row['headers_json']), list) or not isinstance(json.loads(row['mapping_json']), dict):
                     raise ValueError('Invalid saved mapping.')
+            if table == 'scheduled_transactions':
+                if row['frequency'] not in ('weekly', 'biweekly', 'monthly') or row['amount_cents'] == 0 or row['active'] not in (0, 1):
+                    raise ValueError('Invalid scheduled transaction.')
+                date.fromisoformat(row['next_due'])
+            if table == 'scheduled_occurrences':
+                date.fromisoformat(row['due_on'])
+            if table == 'account_reconciliations':
+                date.fromisoformat(row['statement_date'])
+            if table == 'money_moves':
+                changes = json.loads(row['changes_json'])
+                if not isinstance(changes, list) or not all(isinstance(c, dict) and set(c) == {'category_id', 'delta'} and type(c['category_id']) is int and type(c['delta']) is int for c in changes):
+                    raise ValueError('Invalid money move.')
     for table, relations in PARENTS.items():
         for row in tables[table]:
             for column, parent in relations.items():
@@ -123,6 +158,7 @@ def validate(connection, payload):
 
 def replace_budget(connection, budget_id, payload):
     """Caller owns the transaction; deferred foreign keys handle credit-envelope cycles."""
+    payload = normalize(payload)
     validate(connection, payload)
     old = snapshot(connection, budget_id)
     connection.execute('PRAGMA defer_foreign_keys=ON')

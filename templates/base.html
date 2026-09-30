@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark"><title>{% block title %}GreatGatsby Budget{% endblock %}</title>
-{% for sheet in ['app','inbox','transfers','targets','transaction-entry','import-profiles','register-tools','dark-ui'] %}<link rel="stylesheet" href="{{url_for('static',filename=sheet~'.css')}}">{% endfor %}
+{% for sheet in ['app','inbox','transfers','targets','transaction-entry','import-profiles','register-tools','dark-ui','ynab-ui'] %}<link rel="stylesheet" href="{{url_for('static',filename=sheet~'.css')}}">{% endfor %}
 </head><body><button type="button" class="mobile-nav-toggle" aria-controls="app-sidebar" aria-expanded="false" onclick="const expanded=document.body.classList.toggle('sidebar-open');this.setAttribute('aria-expanded',expanded)">☰ Menu</button>{% block body %}{% endblock %}
 <script>document.addEventListener('keydown',event=>{if(event.key==='Escape'){document.body.classList.remove('sidebar-open');document.querySelector('.mobile-nav-toggle').setAttribute('aria-expanded','false')}});if(!document.getElementById('app-sidebar'))document.querySelector('.mobile-nav-toggle').hidden=true;</script>
 </body></html>

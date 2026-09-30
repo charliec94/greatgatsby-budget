@@ -12,6 +12,7 @@ from pathlib import Path
 from flask import Flask, abort, flash, g, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 from household_features import FEATURE_SCHEMA, register_features
+from planning_features import PLANNING_SCHEMA, log_money_move, register_planning_features
 
 
 def create_app(test_config=None):
@@ -43,6 +44,7 @@ def create_app(test_config=None):
     def init_db():
         db().executescript(SCHEMA)
         db().executescript(FEATURE_SCHEMA)
+        db().executescript(PLANNING_SCHEMA)
         needs_credit_rebuild = False
         columns = {row["name"] for row in db().execute("PRAGMA table_info(categories)")}
         if "hidden" not in columns:
@@ -424,6 +426,20 @@ def create_app(test_config=None):
                 row["target_type"], row["target_amount"], row["target_date"], row["assigned"], row["carried"], row["activity"], month
             )
             row["funding_status"] = "overspent" if row["available"] < 0 else "underfunded" if row["underfunded"] else "funded" if row["target_type"] else ""
+        focused_views = db().execute("SELECT * FROM focused_views WHERE budget_id=? AND user_id=? ORDER BY name,id",
+                                     (budget["id"], session["user_id"])).fetchall()
+        focus = request.args.get("view", "all")
+        focused_ids = None
+        if focus == "underfunded":
+            focused_ids = {row["id"] for row in category_rows if row["parent_id"] and row["underfunded"]}
+        elif focus == "overspent":
+            focused_ids = {row["id"] for row in category_rows if row["parent_id"] and row["available"] < 0}
+        elif focus == "available":
+            focused_ids = {row["id"] for row in category_rows if row["parent_id"] and row["available"] > 0}
+        elif focus.startswith("custom-") and focus[7:].isdigit():
+            custom = db().execute("SELECT category_ids_json FROM focused_views WHERE id=? AND budget_id=? AND user_id=?",
+                                  (int(focus[7:]), budget["id"], session["user_id"])).fetchone()
+            focused_ids = set(json.loads(custom["category_ids_json"])) if custom else None
         children = {}
         for row in category_rows:
             if row["parent_id"]:
@@ -431,12 +447,13 @@ def create_app(test_config=None):
         groups = []
         for group in (row for row in category_rows if row["parent_id"] is None):
             all_children = children.get(group["id"], [])
-            group["assigned"] = sum(child["assigned"] for child in all_children)
-            group["activity"] = sum(child["activity"] for child in all_children)
-            group["carried"] = sum(child["carried"] for child in all_children)
+            visible_children = [child for child in all_children if focused_ids is None or child["id"] in focused_ids]
+            group["assigned"] = sum(child["assigned"] for child in visible_children)
+            group["activity"] = sum(child["activity"] for child in visible_children)
+            group["carried"] = sum(child["carried"] for child in visible_children)
             group["available"] = group["carried"] + group["assigned"] + group["activity"]
-            group["children"] = [child for child in all_children if show_hidden or not child["hidden"]]
-            if show_hidden or not group["hidden"]:
+            group["children"] = [child for child in visible_children if show_hidden or not child["hidden"]]
+            if group["children"] and (show_hidden or not group["hidden"]):
                 groups.append(group)
         assignable_categories = [row for row in category_rows if row["parent_id"] and not row["hidden"]]
         spending_categories = [row for row in assignable_categories if row["kind"] == "spending"]
@@ -467,6 +484,7 @@ def create_app(test_config=None):
                                ready_to_assign=ready_to_assign, today=date.today(), month=month,
                                previous_month=previous_month, next_month=next_month,
                                show_hidden=show_hidden, hidden_count=sum(row["hidden"] for row in category_rows),
+                               focused_views=focused_views, focus=focus,
                                underfunded=sum(row["underfunded"] for row in category_rows if row["parent_id"]),
                                entry_categories=spending_categories,
                                payee_rules=db().execute("SELECT payee_key,display_name,category_id FROM payee_category_rules WHERE budget_id=? ORDER BY display_name", (budget["id"],)).fetchall(),
@@ -535,10 +553,13 @@ def create_app(test_config=None):
             "SELECT COALESCE(SUM(amount_cents),0) FROM transactions WHERE account_id=? AND cleared>=1", (account_id,)
         ).fetchone()[0]
         current_balance = account["starting_balance_cents"] + sum(row["amount_cents"] for row in rows)
+        reconciliations = db().execute("SELECT * FROM account_reconciliations WHERE account_id=? ORDER BY id DESC LIMIT 5",
+                                       (account_id,)).fetchall()
         return render_template("account.html", budget=budget, account=account, transactions=transactions, categories=categories,
                                accounts=accounts, splits=splits, cleared_balance=cleared_balance, current_balance=current_balance,
                                today=date.today(), entry_categories=categories, filters=filters, total_count=total_count,
                                payee_rules=db().execute("SELECT payee_key,display_name,category_id FROM payee_category_rules WHERE budget_id=? ORDER BY display_name", (budget["id"],)).fetchall(),
+                               reconciliations=reconciliations,
                                transaction_account_id=account_id, active_view="account", active_account_id=account_id)
 
     @app.post("/accounts/<int:account_id>/bulk")
@@ -659,8 +680,8 @@ def create_app(test_config=None):
         transfer_id = secrets.token_urlsafe(12)
         by_id = {leg["id"]: leg for leg in legs}
         first, second = by_id[transaction_id], by_id[match_id]
-        db().execute("UPDATE transactions SET transfer_id=?,payee=? WHERE id=?", (transfer_id, f"Transfer to {second['account_name']}" if first["amount_cents"] < 0 else f"Transfer from {second['account_name']}", first["id"]))
-        db().execute("UPDATE transactions SET transfer_id=?,payee=? WHERE id=?", (transfer_id, f"Transfer to {first['account_name']}" if second["amount_cents"] < 0 else f"Transfer from {first['account_name']}", second["id"]))
+        db().execute("UPDATE transactions SET transfer_id=?,payee=?,ready_to_assign=0 WHERE id=?", (transfer_id, f"Transfer to {second['account_name']}" if first["amount_cents"] < 0 else f"Transfer from {second['account_name']}", first["id"]))
+        db().execute("UPDATE transactions SET transfer_id=?,payee=?,ready_to_assign=0 WHERE id=?", (transfer_id, f"Transfer to {first['account_name']}" if second["amount_cents"] < 0 else f"Transfer from {first['account_name']}", second["id"]))
         rebuild_credit_activity(budget["id"])
         db().commit()
         flash("The two transactions are now linked as one transfer.", "success")
@@ -679,9 +700,10 @@ def create_app(test_config=None):
             flash("Choose a different account for the other side of the transfer.", "error")
             return redirect(url_for("uncategorized"))
         transfer_id = secrets.token_urlsafe(12)
-        db().execute("UPDATE transactions SET transfer_id=?,payee=? WHERE id=?", (transfer_id,
+        db().execute("UPDATE transactions SET transfer_id=?,payee=?,ready_to_assign=0 WHERE id=?", (transfer_id,
                      f"Transfer to {target['name']}" if transaction["amount_cents"] < 0 else f"Transfer from {target['name']}", transaction_id))
-        db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id) VALUES(?,NULL,?,?,?,?,0,?)",
+        db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id,ready_to_assign)
+            VALUES(?,NULL,?,?,?,?,0,?,0)""",
                      (target["id"], transaction["occurred_on"], f"Transfer from {transaction['account_name']}" if transaction["amount_cents"] < 0 else f"Transfer to {transaction['account_name']}",
                       transaction["memo"], -transaction["amount_cents"], transfer_id))
         rebuild_credit_activity(budget["id"])
@@ -732,7 +754,7 @@ def create_app(test_config=None):
     @login_required
     def map_import(batch_id):
         budget = current_budget()
-        batch = db().execute("SELECT * FROM import_batches WHERE id=? AND budget_id=?", (batch_id, budget["id"])).fetchone()
+        batch = db().execute("SELECT b.*,a.name account_name,a.type account_type FROM import_batches b JOIN accounts a ON a.id=b.account_id WHERE b.id=? AND b.budget_id=?", (batch_id, budget["id"])).fetchone()
         if not batch:
             abort(404)
         headers = json.loads(batch["headers_json"])
@@ -795,24 +817,51 @@ def create_app(test_config=None):
     @login_required
     def review_import(batch_id):
         budget = current_budget()
-        batch = db().execute("SELECT b.*,a.name account_name FROM import_batches b JOIN accounts a ON a.id=b.account_id WHERE b.id=? AND b.budget_id=?", (batch_id, budget["id"])).fetchone()
+        batch = db().execute("SELECT b.*,a.name account_name,a.type account_type FROM import_batches b JOIN accounts a ON a.id=b.account_id WHERE b.id=? AND b.budget_id=?", (batch_id, budget["id"])).fetchone()
         if not batch:
             abort(404)
+        last_reconciliation = db().execute("SELECT MAX(statement_date) FROM account_reconciliations WHERE account_id=?",
+                                           (batch["account_id"],)).fetchone()[0]
         raw_rows = db().execute("""SELECT r.*,EXISTS(SELECT 1 FROM transactions t WHERE t.account_id=b.account_id AND t.occurred_on=r.occurred_on
             AND t.amount_cents=r.amount_cents AND lower(t.payee)=lower(r.payee)) duplicate,pr.category_id suggested_category_id,
             c.name suggested_category_name,p.name suggested_parent_name FROM import_rows r JOIN import_batches b ON b.id=r.batch_id
             LEFT JOIN payee_category_rules pr ON pr.budget_id=b.budget_id AND pr.payee_key=lower(trim(r.payee))
             LEFT JOIN categories c ON c.id=pr.category_id LEFT JOIN categories p ON p.id=c.parent_id
             WHERE r.batch_id=? ORDER BY r.occurred_on,r.id""", (batch_id,)).fetchall()
+        transfer_rows = db().execute("""SELECT t.*,a.name account_name,a.type account_type FROM transactions t
+            JOIN accounts a ON a.id=t.account_id WHERE a.budget_id=? AND t.account_id!=? AND t.category_id IS NULL
+            AND t.transfer_id IS NULL AND t.cleared!=2 AND NOT EXISTS(SELECT 1 FROM transaction_splits s WHERE s.transaction_id=t.id)""",
+            (budget["id"], batch["account_id"])).fetchall()
+        transfers_by_amount = {}
+        for candidate in transfer_rows:
+            transfers_by_amount.setdefault(candidate["amount_cents"], []).append(dict(candidate))
+        pending_rows = db().execute("""SELECT r.*,b.account_id,a.name account_name,a.type account_type FROM import_rows r
+            JOIN import_batches b ON b.id=r.batch_id JOIN accounts a ON a.id=b.account_id
+            WHERE b.budget_id=? AND b.id!=? AND b.account_id!=? AND r.imported=0""",
+            (budget["id"], batch_id, batch["account_id"])).fetchall()
+        pending_by_amount = {}
+        for candidate in pending_rows:
+            pending_by_amount.setdefault(candidate["amount_cents"], []).append(dict(candidate))
         rows = []
         for raw in raw_rows:
             row = dict(raw)
-            row["selected"] = bool(row["review_selected"]) if row["review_selected"] is not None else not bool(row["duplicate"])
+            candidates = [candidate for candidate in transfers_by_amount.get(-row["amount_cents"], [])
+                          if abs((date.fromisoformat(candidate["occurred_on"]) - date.fromisoformat(row["occurred_on"])).days) <= 3]
+            candidates.sort(key=lambda candidate: (0 if "credit" in (batch["account_type"], candidate["account_type"]) else 1,
+                                                   abs((date.fromisoformat(candidate["occurred_on"]) - date.fromisoformat(row["occurred_on"])).days), candidate["id"]))
+            waiting = [candidate for candidate in pending_by_amount.get(-row["amount_cents"], [])
+                       if abs((date.fromisoformat(candidate["occurred_on"]) - date.fromisoformat(row["occurred_on"])).days) <= 3]
+            waiting.sort(key=lambda candidate: (0 if "credit" in (batch["account_type"], candidate["account_type"]) else 1,
+                                                abs((date.fromisoformat(candidate["occurred_on"]) - date.fromisoformat(row["occurred_on"])).days), candidate["id"]))
+            row["transfer_match"] = candidates[0] if candidates else None
+            row["pending_transfer"] = waiting[0] if waiting else None
+            row["before_reconciliation"] = bool(last_reconciliation and row["occurred_on"] <= last_reconciliation)
+            row["selected"] = bool(row["review_selected"]) if row["review_selected"] is not None else not bool(row["duplicate"] or row["before_reconciliation"])
             if row["review_category"] is not None:
                 row["category_choice"] = row["review_category"]
             elif row["suggested_category_id"]:
                 row["category_choice"] = str(row["suggested_category_id"])
-            elif row["amount_cents"] > 0:
+            elif row["amount_cents"] > 0 and batch["account_type"] != "credit":
                 row["category_choice"] = "ready_to_assign"
             else:
                 row["category_choice"] = ""
@@ -820,7 +869,16 @@ def create_app(test_config=None):
         categories = db().execute("""SELECT c.id,c.name,p.name parent_name FROM categories c JOIN categories p ON p.id=c.parent_id
             WHERE c.budget_id=? AND c.kind='spending' AND c.hidden=0 ORDER BY p.name,c.name""", (budget["id"],)).fetchall()
         return render_template("import_review.html", budget=budget, accounts=sidebar_accounts(budget["id"]), batch=batch,
-                               rows=rows, categories=categories, active_view="imports", active_account_id=None)
+                               rows=rows, categories=categories, last_reconciliation=last_reconciliation,
+                               active_view="imports", active_account_id=None)
+
+    def import_transfer_match(budget_id, source_account_id, occurred_on, amount_cents, match_id):
+        return db().execute("""SELECT t.*,a.name account_name,a.type account_type,source.name source_account_name
+            FROM transactions t JOIN accounts a ON a.id=t.account_id JOIN accounts source ON source.id=?
+            WHERE t.id=? AND a.budget_id=? AND t.account_id!=? AND t.amount_cents=?
+            AND ABS(julianday(t.occurred_on)-julianday(?))<=3 AND t.category_id IS NULL AND t.transfer_id IS NULL
+            AND t.cleared!=2 AND NOT EXISTS(SELECT 1 FROM transaction_splits s WHERE s.transaction_id=t.id)""",
+            (source_account_id, match_id, budget_id, source_account_id, -amount_cents, occurred_on)).fetchone()
 
     @app.post("/imports/<int:batch_id>/autosave")
     @login_required
@@ -833,10 +891,15 @@ def create_app(test_config=None):
             abort(404)
         if row["imported"]:
             return ("", 204)
+        batch = db().execute("SELECT b.account_id,a.type account_type FROM import_batches b JOIN accounts a ON a.id=b.account_id WHERE b.id=?", (batch_id,)).fetchone()
         choice = request.form.get("category", "")
-        if choice == "ready_to_assign":
-            if row["amount_cents"] <= 0:
-                abort(400, "Ready to Assign is only available for inflows")
+        if choice.startswith("transfer:"):
+            match_id = int(choice.split(":", 1)[1]) if choice.split(":", 1)[1].isdigit() else None
+            if not match_id or not import_transfer_match(budget["id"], batch["account_id"], row["occurred_on"], row["amount_cents"], match_id):
+                abort(400, "Invalid transfer match")
+        elif choice == "ready_to_assign":
+            if row["amount_cents"] <= 0 or batch["account_type"] == "credit":
+                abort(400, "Ready to Assign is only available for inflows to cash accounts")
         elif choice and (not choice.isdigit() or not db().execute(
             "SELECT 1 FROM categories WHERE id=? AND budget_id=? AND parent_id IS NOT NULL AND kind='spending'",
             (int(choice), budget["id"]),
@@ -851,7 +914,9 @@ def create_app(test_config=None):
     @login_required
     def commit_import(batch_id):
         budget = current_budget()
-        batch = db().execute("SELECT * FROM import_batches WHERE id=? AND budget_id=?", (batch_id, budget["id"])).fetchone()
+        batch = db().execute("""SELECT b.*,a.name account_name,a.type account_type
+            FROM import_batches b JOIN accounts a ON a.id=b.account_id
+            WHERE b.id=? AND b.budget_id=?""", (batch_id, budget["id"])).fetchone()
         if not batch:
             abort(404)
         selected = {int(value) for value in request.form.getlist("selected") if value.isdigit()}
@@ -873,17 +938,33 @@ def create_app(test_config=None):
             choice = request.form.get(f"category_{row['id']}")
             if choice is None:
                 choice = row["review_category"] or ""
-            if choice == "ready_to_assign" and row["amount_cents"] <= 0:
-                abort(400, "Ready to Assign is only available for inflows")
-            if choice and choice != "ready_to_assign" and not choice.isdigit():
+            transfer_match = None
+            if choice.startswith("transfer:"):
+                match_id = int(choice.split(":", 1)[1]) if choice.split(":", 1)[1].isdigit() else None
+                transfer_match = import_transfer_match(budget["id"], batch["account_id"], row["occurred_on"], row["amount_cents"], match_id) if match_id else None
+                if not transfer_match:
+                    abort(400, "That transfer match is no longer available")
+            elif choice == "ready_to_assign" and (row["amount_cents"] <= 0 or batch["account_type"] == "credit"):
+                abort(400, "Ready to Assign is only available for inflows to cash accounts")
+            elif choice and choice != "ready_to_assign" and not choice.isdigit():
                 abort(400, "Invalid category")
             category_id = int(choice) if choice.isdigit() else None
             valid = category_id and db().execute("SELECT 1 FROM categories WHERE id=? AND budget_id=? AND parent_id IS NOT NULL AND kind='spending'", (category_id, budget["id"])).fetchone()
             if category_id and not valid:
                 abort(400, "Invalid category")
             ready_to_assign = 1 if choice == "ready_to_assign" and row["amount_cents"] > 0 else 0
-            db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,ready_to_assign) VALUES(?,?,?,?,?,?,0,?)",
-                         (batch["account_id"], category_id if valid else None, row["occurred_on"], row["payee"], row["memo"], row["amount_cents"], ready_to_assign))
+            if transfer_match:
+                transfer_id = secrets.token_urlsafe(12)
+                imported_payee = f"Transfer to {transfer_match['account_name']}" if row["amount_cents"] < 0 else f"Transfer from {transfer_match['account_name']}"
+                existing_payee = f"Transfer to {batch['account_name']}" if transfer_match["amount_cents"] < 0 else f"Transfer from {batch['account_name']}"
+                db().execute("UPDATE transactions SET transfer_id=?,payee=?,category_id=NULL,ready_to_assign=0 WHERE id=?",
+                             (transfer_id, existing_payee, transfer_match["id"]))
+                db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id,ready_to_assign)
+                    VALUES(?,NULL,?,?,?,?,0,?,0)""", (batch["account_id"], row["occurred_on"], imported_payee,
+                    row["memo"], row["amount_cents"], transfer_id))
+            else:
+                db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,ready_to_assign) VALUES(?,?,?,?,?,?,0,?)",
+                             (batch["account_id"], category_id if valid else None, row["occurred_on"], row["payee"], row["memo"], row["amount_cents"], ready_to_assign))
             if valid:
                 remember_payee_category(budget["id"], row["payee"], category_id)
             db().execute("UPDATE import_rows SET imported=1,review_selected=0,review_category=? WHERE id=?", (choice, row["id"]))
@@ -938,11 +1019,17 @@ def create_app(test_config=None):
         if not category or category["parent_id"] is None:
             abort(400, "Money can only be assigned to subcategories")
         month, _, _ = selected_month(request.form.get("month"))
+        new_assigned = money(request.form.get("assigned", "0"))
+        existing = db().execute("SELECT assigned_cents FROM category_assignments WHERE category_id=? AND month=?",
+                                (category_id, month.strftime("%Y-%m"))).fetchone()
+        old_assigned = existing["assigned_cents"] if existing else 0
         db().execute(
             """INSERT INTO category_assignments(category_id,month,assigned_cents) VALUES(?,?,?)
                ON CONFLICT(category_id,month) DO UPDATE SET assigned_cents=excluded.assigned_cents""",
-            (category_id, month.strftime("%Y-%m"), money(request.form.get("assigned", "0"))),
+            (category_id, month.strftime("%Y-%m"), new_assigned),
         )
+        log_money_move(db(), budget["id"], session["user_id"], month.strftime("%Y-%m"),
+                       f"Changed {category['name']} assignment", [{"category_id": category_id, "delta": new_assigned - old_assigned}])
         db().commit()
         flash(f"Updated {category['name']} for {month.strftime('%B %Y')}.", "success")
         return redirect(url_for("dashboard", month=month.strftime("%Y-%m"), show_hidden=request.form.get("show_hidden") or None))
@@ -1097,6 +1184,9 @@ def create_app(test_config=None):
                    ON CONFLICT(category_id,month) DO UPDATE SET assigned_cents=assigned_cents+excluded.assigned_cents""",
                 (category_id, month.strftime("%Y-%m"), adjustment),
             )
+        log_money_move(db(), budget["id"], session["user_id"], month.strftime("%Y-%m"),
+                       f"Moved money from {by_id[source_id]['name']} to {by_id[target_id]['name']}",
+                       [{"category_id": int(source_id), "delta": -amount}, {"category_id": int(target_id), "delta": amount}])
         db().commit()
         flash(f"Moved ${amount/100:,.2f} from {by_id[source_id]['name']} to {by_id[target_id]['name']}.", "success")
         return redirect(url_for("dashboard", month=month.strftime("%Y-%m")))
@@ -1376,20 +1466,40 @@ def create_app(test_config=None):
         if not account:
             abort(404)
         statement_balance = money(request.form.get("statement_balance", "0"))
+        statement_date = request.form.get("statement_date") or date.today().isoformat()
+        try:
+            datetime.strptime(statement_date, "%Y-%m-%d")
+        except ValueError:
+            abort(400, "Invalid reconciliation date")
         cleared_balance = account["starting_balance_cents"] + db().execute(
-            "SELECT COALESCE(SUM(amount_cents),0) FROM transactions WHERE account_id=? AND cleared>=1", (account_id,)
+            "SELECT COALESCE(SUM(amount_cents),0) FROM transactions WHERE account_id=? AND cleared>=1 AND occurred_on<=?", (account_id, statement_date)
         ).fetchone()[0]
         difference = statement_balance - cleared_balance
-        if difference:
+        adjustment_id = None
+        if difference and request.form.get("create_adjustment") != "1":
             flash(f"Not reconciled: the statement differs from cleared transactions by ${difference/100:,.2f}.", "error")
         else:
-            db().execute("UPDATE transactions SET cleared=2 WHERE account_id=? AND cleared=1", (account_id,))
+            if difference:
+                cursor = db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,ready_to_assign)
+                    VALUES(?,NULL,?,'Reconciliation Balance Adjustment','Created during reconciliation',?,2,?)""",
+                    (account_id, statement_date, difference, 1 if difference > 0 else 0))
+                adjustment_id = cursor.lastrowid
+            db().execute("UPDATE transactions SET cleared=2 WHERE account_id=? AND cleared=1 AND occurred_on<=?", (account_id, statement_date))
+            db().execute("""INSERT INTO account_reconciliations(budget_id,account_id,user_id,statement_date,statement_balance_cents,
+                cleared_balance_cents,adjustment_cents,adjustment_transaction_id) VALUES(?,?,?,?,?,?,?,?)""",
+                (budget["id"], account_id, session["user_id"], statement_date, statement_balance,
+                 cleared_balance, difference, adjustment_id))
+            rebuild_credit_activity(budget["id"])
             db().commit()
-            flash("Account reconciled. Cleared transactions are now locked as reconciled.", "success")
+            message = "Account reconciled. Cleared transactions are now locked."
+            if difference:
+                message += f" A ${abs(difference)/100:,.2f} balance adjustment was created."
+            flash(message, "success")
         return redirect(url_for("account_register", account_id=account_id))
 
     app.get_db = db
     register_features(app, db, current_budget, login_required, sidebar_accounts)
+    register_planning_features(app, db, current_budget, login_required, sidebar_accounts, money, target_metrics, rebuild_credit_activity)
     return app
 
 
