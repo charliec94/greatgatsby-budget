@@ -9,6 +9,7 @@ A private, local-first household budgeting application inspired by envelope budg
 - Account balances are derived from starting balances plus their transaction ledgers.
 - Account transfers create linked, equal-and-opposite transactions and are not spending.
 - Statement review suggests transfer matches across accounts when the amounts are opposite and the dates are within three days. Confirming the suggestion links both legs instead of counting either one as income or spending; if the other statement draft has not been imported yet, the review shows a waiting hint.
+- Import review can also create a transfer directly to another account. The imported leg is cleared, an equal-and-opposite pending leg is created in the destination account, and a later statement import confirms that pending leg instead of creating a duplicate.
 - Funded credit-card spending automatically reserves cash in the card's payment envelope.
 - Unfunded credit-card spending creates debt without creating payment cash.
 - Credit-card payments are transfers from a cash account to the card and reduce the payment envelope.

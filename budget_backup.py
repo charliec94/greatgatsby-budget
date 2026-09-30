@@ -32,6 +32,12 @@ def normalize(payload):
             for table in TABLES[len(LEGACY_TABLES):]:
                 payload['tables'][table] = []
             payload['version'] = 2
+    if isinstance(payload, dict) and isinstance(payload.get('tables'), dict):
+        transactions = payload['tables'].get('transactions')
+        if isinstance(transactions, list):
+            for row in transactions:
+                if isinstance(row, dict) and 'pending_transfer' not in row:
+                    row['pending_transfer'] = 0
     return payload
 
 
@@ -145,6 +151,8 @@ def validate(connection, payload):
     for t in tables['transactions']:
         if t['cleared'] not in (0, 1, 2):
             raise ValueError('Invalid transaction status.')
+        if t['pending_transfer'] not in (0, 1) or (t['pending_transfer'] and not t['transfer_id']):
+            raise ValueError('Invalid pending transfer state.')
         if t['id'] in split_totals and (split_totals[t['id']] != t['amount_cents'] or t['category_id'] or t['transfer_id']):
             raise ValueError('Unbalanced split transaction.')
         if t['transfer_id']:

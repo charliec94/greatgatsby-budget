@@ -60,8 +60,8 @@ def test_import_review_autosaves_ready_to_assign_and_allows_partial_commit(tmp_p
 
     connection = sqlite3.connect(tmp_path / "test.db")
     assert connection.execute("SELECT COUNT(*) FROM transactions WHERE account_id=?", (account_id,)).fetchone()[0] == 2
-    assert connection.execute("SELECT ready_to_assign,category_id FROM transactions WHERE payee='Employer'").fetchone() == (1, None)
-    assert connection.execute("SELECT category_id FROM transactions WHERE payee='Market'").fetchone()[0] == grocery_id
+    assert connection.execute("SELECT ready_to_assign,category_id,cleared FROM transactions WHERE payee='Employer'").fetchone() == (1, None, 1)
+    assert connection.execute("SELECT category_id,cleared FROM transactions WHERE payee='Market'").fetchone() == (grocery_id, 1)
     assert connection.execute("SELECT status FROM import_batches WHERE id=?", (batch_id,)).fetchone()[0] == "imported"
     assert connection.execute("SELECT COUNT(*) FROM import_rows WHERE batch_id=? AND imported=1", (batch_id,)).fetchone()[0] == 2
     connection.close()
@@ -77,3 +77,13 @@ def test_autosave_rejects_ready_to_assign_for_outflow(tmp_path):
     response = client.post(f"/imports/{batch_id}/autosave", data={"csrf_token": csrf, "row_id": rows["Market"],
         "selected": "1", "category": "ready_to_assign"})
     assert response.status_code == 400
+
+
+def test_uncategorized_csv_import_stays_uncleared(tmp_path):
+    client, csrf, _account_id, _group_id, _grocery_id, batch_id, rows = prepared_import(tmp_path)
+    imported = client.post(f"/imports/{batch_id}/commit", data={"csrf_token": csrf, "selected": str(rows["Market"]),
+        f"category_{rows['Market']}": ""}, follow_redirects=True)
+    assert b"Imported 1 transaction" in imported.data
+    connection = sqlite3.connect(tmp_path / "test.db")
+    assert connection.execute("SELECT category_id,ready_to_assign,cleared FROM transactions WHERE payee='Market'").fetchone() == (None, 0, 0)
+    connection.close()

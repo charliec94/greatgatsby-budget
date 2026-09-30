@@ -67,6 +67,8 @@ def create_app(test_config=None):
             needs_credit_rebuild = True
         if "ready_to_assign" not in transaction_columns:
             db().execute("ALTER TABLE transactions ADD COLUMN ready_to_assign INTEGER NOT NULL DEFAULT 0")
+        if "pending_transfer" not in transaction_columns:
+            db().execute("ALTER TABLE transactions ADD COLUMN pending_transfer INTEGER NOT NULL DEFAULT 0")
         import_row_columns = {row["name"] for row in db().execute("PRAGMA table_info(import_rows)")}
         if "review_selected" not in import_row_columns:
             db().execute("ALTER TABLE import_rows ADD COLUMN review_selected INTEGER")
@@ -868,6 +870,15 @@ def create_app(test_config=None):
         transfers_by_amount = {}
         for candidate in transfer_rows:
             transfers_by_amount.setdefault(candidate["amount_cents"], []).append(dict(candidate))
+        pending_legs = db().execute("""SELECT t.*,other.name other_account_name FROM transactions t
+            JOIN accounts a ON a.id=t.account_id
+            JOIN transactions pair ON pair.transfer_id=t.transfer_id AND pair.id!=t.id
+            JOIN accounts other ON other.id=pair.account_id
+            WHERE a.budget_id=? AND t.account_id=? AND t.pending_transfer=1 AND t.transfer_id IS NOT NULL""",
+            (budget["id"], batch["account_id"])).fetchall()
+        pending_legs_by_amount = {}
+        for candidate in pending_legs:
+            pending_legs_by_amount.setdefault(candidate["amount_cents"], []).append(dict(candidate))
         pending_rows = db().execute("""SELECT r.*,b.account_id,a.name account_name,a.type account_type FROM import_rows r
             JOIN import_batches b ON b.id=r.batch_id JOIN accounts a ON a.id=b.account_id
             WHERE b.budget_id=? AND b.id!=? AND b.account_id!=? AND r.imported=0""",
@@ -886,12 +897,18 @@ def create_app(test_config=None):
                        if abs((date.fromisoformat(candidate["occurred_on"]) - date.fromisoformat(row["occurred_on"])).days) <= 3]
             waiting.sort(key=lambda candidate: (0 if "credit" in (batch["account_type"], candidate["account_type"]) else 1,
                                                 abs((date.fromisoformat(candidate["occurred_on"]) - date.fromisoformat(row["occurred_on"])).days), candidate["id"]))
+            pending_matches = [candidate for candidate in pending_legs_by_amount.get(row["amount_cents"], [])
+                               if abs((date.fromisoformat(candidate["occurred_on"]) - date.fromisoformat(row["occurred_on"])).days) <= 3]
+            pending_matches.sort(key=lambda candidate: (abs((date.fromisoformat(candidate["occurred_on"]) - date.fromisoformat(row["occurred_on"])).days), candidate["id"]))
+            row["pending_leg_match"] = pending_matches[0] if pending_matches else None
             row["transfer_match"] = candidates[0] if candidates else None
             row["pending_transfer"] = waiting[0] if waiting else None
             row["before_reconciliation"] = bool(last_reconciliation and row["occurred_on"] <= last_reconciliation)
             row["selected"] = bool(row["review_selected"]) if row["review_selected"] is not None else not bool(row["duplicate"] or row["before_reconciliation"])
             if row["review_category"] is not None:
                 row["category_choice"] = row["review_category"]
+            elif row["pending_leg_match"]:
+                row["category_choice"] = f"transfer_pending:{row['pending_leg_match']['id']}"
             elif row["suggested_category_id"]:
                 row["category_choice"] = str(row["suggested_category_id"])
             elif row["amount_cents"] > 0 and batch["account_type"] != "credit":
@@ -901,8 +918,10 @@ def create_app(test_config=None):
             rows.append(row)
         categories = db().execute("""SELECT c.id,c.name,p.name parent_name FROM categories c JOIN categories p ON p.id=c.parent_id
             WHERE c.budget_id=? AND c.kind='spending' AND c.hidden=0 ORDER BY p.name,c.name""", (budget["id"],)).fetchall()
+        transfer_accounts = db().execute("SELECT id,name,type FROM accounts WHERE budget_id=? AND id!=? ORDER BY type='credit',name",
+                                         (budget["id"], batch["account_id"])).fetchall()
         return render_template("import_review.html", budget=budget, accounts=sidebar_accounts(budget["id"]), batch=batch,
-                               rows=rows, categories=categories, last_reconciliation=last_reconciliation,
+                               rows=rows, categories=categories, transfer_accounts=transfer_accounts, last_reconciliation=last_reconciliation,
                                active_view="imports", active_account_id=None)
 
     def import_transfer_match(budget_id, source_account_id, occurred_on, amount_cents, match_id):
@@ -912,6 +931,20 @@ def create_app(test_config=None):
             AND ABS(julianday(t.occurred_on)-julianday(?))<=3 AND t.category_id IS NULL AND t.transfer_id IS NULL
             AND t.cleared!=2 AND NOT EXISTS(SELECT 1 FROM transaction_splits s WHERE s.transaction_id=t.id)""",
             (source_account_id, match_id, budget_id, source_account_id, -amount_cents, occurred_on)).fetchone()
+
+    def pending_import_transfer_match(budget_id, account_id, occurred_on, amount_cents, match_id):
+        return db().execute("""SELECT t.*,other.name other_account_name FROM transactions t
+            JOIN accounts a ON a.id=t.account_id
+            JOIN transactions pair ON pair.transfer_id=t.transfer_id AND pair.id!=t.id
+            JOIN accounts other ON other.id=pair.account_id
+            WHERE t.id=? AND a.budget_id=? AND t.account_id=? AND t.amount_cents=?
+            AND ABS(julianday(t.occurred_on)-julianday(?))<=3 AND t.pending_transfer=1
+            AND t.transfer_id IS NOT NULL AND t.category_id IS NULL AND t.cleared=0""",
+            (match_id, budget_id, account_id, amount_cents, occurred_on)).fetchone()
+
+    def import_transfer_target(budget_id, source_account_id, target_id):
+        return db().execute("SELECT id,name,type FROM accounts WHERE id=? AND budget_id=? AND id!=?",
+                            (target_id, budget_id, source_account_id)).fetchone()
 
     @app.post("/imports/<int:batch_id>/autosave")
     @login_required
@@ -926,7 +959,15 @@ def create_app(test_config=None):
             return ("", 204)
         batch = db().execute("SELECT b.account_id,a.type account_type FROM import_batches b JOIN accounts a ON a.id=b.account_id WHERE b.id=?", (batch_id,)).fetchone()
         choice = request.form.get("category", "")
-        if choice.startswith("transfer:"):
+        if choice.startswith("transfer_pending:"):
+            match_id = int(choice.split(":", 1)[1]) if choice.split(":", 1)[1].isdigit() else None
+            if not match_id or not pending_import_transfer_match(budget["id"], batch["account_id"], row["occurred_on"], row["amount_cents"], match_id):
+                abort(400, "Invalid pending transfer match")
+        elif choice.startswith("transfer_new:"):
+            target_id = int(choice.split(":", 1)[1]) if choice.split(":", 1)[1].isdigit() else None
+            if not target_id or not import_transfer_target(budget["id"], batch["account_id"], target_id):
+                abort(400, "Invalid transfer account")
+        elif choice.startswith("transfer:"):
             match_id = int(choice.split(":", 1)[1]) if choice.split(":", 1)[1].isdigit() else None
             if not match_id or not import_transfer_match(budget["id"], batch["account_id"], row["occurred_on"], row["amount_cents"], match_id):
                 abort(400, "Invalid transfer match")
@@ -972,7 +1013,21 @@ def create_app(test_config=None):
             if choice is None:
                 choice = row["review_category"] or ""
             transfer_match = None
-            if choice.startswith("transfer:"):
+            pending_transfer_match = None
+            new_transfer_target = None
+            if choice.startswith("transfer_pending:"):
+                match_id = int(choice.split(":", 1)[1]) if choice.split(":", 1)[1].isdigit() else None
+                pending_transfer_match = pending_import_transfer_match(
+                    budget["id"], batch["account_id"], row["occurred_on"], row["amount_cents"], match_id
+                ) if match_id else None
+                if not pending_transfer_match:
+                    abort(400, "That pending transfer match is no longer available")
+            elif choice.startswith("transfer_new:"):
+                target_id = int(choice.split(":", 1)[1]) if choice.split(":", 1)[1].isdigit() else None
+                new_transfer_target = import_transfer_target(budget["id"], batch["account_id"], target_id) if target_id else None
+                if not new_transfer_target:
+                    abort(400, "That transfer account is no longer available")
+            elif choice.startswith("transfer:"):
                 match_id = int(choice.split(":", 1)[1]) if choice.split(":", 1)[1].isdigit() else None
                 transfer_match = import_transfer_match(budget["id"], batch["account_id"], row["occurred_on"], row["amount_cents"], match_id) if match_id else None
                 if not transfer_match:
@@ -986,18 +1041,35 @@ def create_app(test_config=None):
             if category_id and not valid:
                 abort(400, "Invalid category")
             ready_to_assign = 1 if choice == "ready_to_assign" and row["amount_cents"] > 0 else 0
-            if transfer_match:
+            # A categorized statement row represents a posted bank transaction. Keep
+            # uncategorized rows uncleared so they remain visibly pending review.
+            imported_cleared = 1 if choice else 0
+            if pending_transfer_match:
+                db().execute("""UPDATE transactions SET occurred_on=?,payee=?,memo=?,cleared=1,pending_transfer=0,
+                    category_id=NULL,ready_to_assign=0 WHERE id=?""",
+                    (row["occurred_on"], row["payee"], row["memo"], pending_transfer_match["id"]))
+            elif new_transfer_target:
+                transfer_id = secrets.token_urlsafe(12)
+                imported_payee = f"Transfer to {new_transfer_target['name']}" if row["amount_cents"] < 0 else f"Transfer from {new_transfer_target['name']}"
+                pending_payee = f"Transfer from {batch['account_name']}" if row["amount_cents"] < 0 else f"Transfer to {batch['account_name']}"
+                db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id,ready_to_assign,pending_transfer)
+                    VALUES(?,NULL,?,?,?,?,1,?,0,0)""", (batch["account_id"], row["occurred_on"], imported_payee,
+                    row["memo"], row["amount_cents"], transfer_id))
+                db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id,ready_to_assign,pending_transfer)
+                    VALUES(?,NULL,?,?,?,?,0,?,0,1)""", (new_transfer_target["id"], row["occurred_on"], pending_payee,
+                    "Waiting for statement import", -row["amount_cents"], transfer_id))
+            elif transfer_match:
                 transfer_id = secrets.token_urlsafe(12)
                 imported_payee = f"Transfer to {transfer_match['account_name']}" if row["amount_cents"] < 0 else f"Transfer from {transfer_match['account_name']}"
                 existing_payee = f"Transfer to {batch['account_name']}" if transfer_match["amount_cents"] < 0 else f"Transfer from {batch['account_name']}"
                 db().execute("UPDATE transactions SET transfer_id=?,payee=?,category_id=NULL,ready_to_assign=0 WHERE id=?",
                              (transfer_id, existing_payee, transfer_match["id"]))
                 db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id,ready_to_assign)
-                    VALUES(?,NULL,?,?,?,?,0,?,0)""", (batch["account_id"], row["occurred_on"], imported_payee,
+                    VALUES(?,NULL,?,?,?,?,1,?,0)""", (batch["account_id"], row["occurred_on"], imported_payee,
                     row["memo"], row["amount_cents"], transfer_id))
             else:
-                db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,ready_to_assign) VALUES(?,?,?,?,?,?,0,?)",
-                             (batch["account_id"], category_id if valid else None, row["occurred_on"], row["payee"], row["memo"], row["amount_cents"], ready_to_assign))
+                db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,ready_to_assign) VALUES(?,?,?,?,?,?,?,?)",
+                             (batch["account_id"], category_id if valid else None, row["occurred_on"], row["payee"], row["memo"], row["amount_cents"], imported_cleared, ready_to_assign))
             if valid:
                 remember_payee_category(budget["id"], row["payee"], category_id)
             db().execute("UPDATE import_rows SET imported=1,review_selected=0,review_category=? WHERE id=?", (choice, row["id"]))
