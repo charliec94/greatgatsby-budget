@@ -108,6 +108,35 @@ def test_ready_to_assign_picker_and_cover_overspending(tmp_path):
     connection.close()
 
 
+def test_ready_breakdown_and_audited_starting_balance_correction(tmp_path):
+    client = make_client(tmp_path)
+    client.post("/setup", data={"csrf_token": token(client), "name": "Charlie", "email": "charlie@example.com", "password": "a-strong-password"})
+    csrf = token(client, "/")
+    client.post("/accounts", data={"csrf_token": csrf, "name": "Checking", "type": "checking", "balance": "1000",
+        "starting_balance_date": "2026-08-31"})
+    connection = sqlite3.connect(tmp_path / "test.db")
+    account_id = connection.execute("SELECT id FROM accounts WHERE name='Checking'").fetchone()[0]
+    connection.close()
+
+    dashboard = client.get("/?month=2026-09")
+    assert b"How this is calculated" in dashboard.data
+    assert b"Cash in budget accounts" in dashboard.data
+    corrected = client.post(f"/accounts/{account_id}/settings", data={"csrf_token": csrf,
+        "starting_balance": "950", "starting_balance_date": "2026-08-30", "reason": "Corrected from statement"}, follow_redirects=True)
+    assert b"Starting balance corrected and recorded" in corrected.data
+    assert b"Starting balance history" in corrected.data
+    connection = sqlite3.connect(tmp_path / "test.db")
+    assert connection.execute("SELECT starting_balance_cents,starting_balance_date FROM accounts WHERE id=?", (account_id,)).fetchone() == (95000, "2026-08-30")
+    assert connection.execute("SELECT old_balance_cents,new_balance_cents,reason FROM account_balance_changes").fetchone() == (100000, 95000, "Corrected from statement")
+    connection.execute("INSERT INTO transactions(account_id,occurred_on,payee,amount_cents,cleared) VALUES(?,?,?,?,2)",
+                       (account_id, "2026-09-01", "Locked", -1000))
+    connection.commit()
+    connection.close()
+    blocked = client.post(f"/accounts/{account_id}/settings", data={"csrf_token": csrf,
+        "starting_balance": "900", "starting_balance_date": "2026-08-30", "reason": "Try again"}, follow_redirects=True)
+    assert b"Use Reconcile with a balance adjustment" in blocked.data
+
+
 def test_targets_progress_and_fund_underfunded_stops_at_zero(tmp_path):
     client = make_client(tmp_path)
     client.post("/setup", data={"csrf_token": token(client), "name": "Charlie", "email": "charlie@example.com", "password": "a-strong-password"})

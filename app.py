@@ -61,6 +61,8 @@ def create_app(test_config=None):
                 """UPDATE accounts SET starting_balance_cents=balance_cents-
                    COALESCE((SELECT SUM(amount_cents) FROM transactions WHERE account_id=accounts.id),0)"""
             )
+        if "starting_balance_date" not in account_columns:
+            db().execute("ALTER TABLE accounts ADD COLUMN starting_balance_date TEXT")
         transaction_columns = {row["name"] for row in db().execute("PRAGMA table_info(transactions)")}
         if "transfer_id" not in transaction_columns:
             db().execute("ALTER TABLE transactions ADD COLUMN transfer_id TEXT")
@@ -289,6 +291,47 @@ def create_app(test_config=None):
         ).fetchone()[0]
         return cash - available
 
+    def ready_to_assign_breakdown(budget_id, month, next_month):
+        cash_accounts = db().execute(
+            """SELECT a.id,a.name,a.type,a.starting_balance_cents+
+                      COALESCE((SELECT SUM(t.amount_cents) FROM transactions t
+                                WHERE t.account_id=a.id AND t.occurred_on<?),0) balance
+               FROM accounts a WHERE a.budget_id=? AND a.type!='credit' ORDER BY a.name""",
+            (next_month.isoformat(), budget_id),
+        ).fetchall()
+        balances = db().execute(
+            """SELECT c.id,c.name,p.name parent_name,
+                      COALESCE((SELECT SUM(assigned_cents) FROM category_assignments
+                                WHERE category_id=c.id AND month<=?),0)
+                      +COALESCE((SELECT SUM(amount_cents) FROM transactions
+                                 WHERE category_id=c.id AND occurred_on<?),0)
+                      +COALESCE((SELECT SUM(s.amount_cents) FROM transaction_splits s JOIN transactions t ON t.id=s.transaction_id
+                                 WHERE s.category_id=c.id AND t.occurred_on<?),0)
+                      +COALESCE((SELECT SUM(amount_cents) FROM category_activity
+                                 WHERE category_id=c.id AND occurred_on<?),0) balance
+               FROM categories c JOIN categories p ON p.id=c.parent_id WHERE c.budget_id=?""",
+            (month.strftime("%Y-%m"), next_month.isoformat(), next_month.isoformat(), next_month.isoformat(), budget_id),
+        ).fetchall()
+        cash = sum(row["balance"] for row in cash_accounts)
+        available = sum(max(row["balance"], 0) for row in balances)
+        overspent = sum(-row["balance"] for row in balances if row["balance"] < 0)
+        income = db().execute(
+            """SELECT COALESCE(SUM(t.amount_cents),0) FROM transactions t JOIN accounts a ON a.id=t.account_id
+               WHERE a.budget_id=? AND a.type!='credit' AND t.ready_to_assign=1
+               AND t.occurred_on>=? AND t.occurred_on<?""",
+            (budget_id, month.isoformat(), next_month.isoformat()),
+        ).fetchone()[0]
+        assigned = db().execute(
+            """SELECT COALESCE(SUM(ca.assigned_cents),0) FROM category_assignments ca JOIN categories c ON c.id=ca.category_id
+               WHERE c.budget_id=? AND ca.month=?""", (budget_id, month.strftime("%Y-%m"))
+        ).fetchone()[0]
+        future_assigned = db().execute(
+            """SELECT COALESCE(SUM(ca.assigned_cents),0) FROM category_assignments ca JOIN categories c ON c.id=ca.category_id
+               WHERE c.budget_id=? AND ca.month>?""", (budget_id, month.strftime("%Y-%m"))
+        ).fetchone()[0]
+        return dict(cash_accounts=cash_accounts, cash=cash, available=available, overspent=overspent,
+                    income=income, assigned=assigned, future_assigned=future_assigned, ready=cash-available)
+
     def category_balance_for_month(category_id, month, next_month):
         return db().execute(
             """SELECT COALESCE((SELECT SUM(assigned_cents) FROM category_assignments
@@ -509,7 +552,8 @@ def create_app(test_config=None):
         activity = sum(row["activity"] for row in category_rows if row["parent_id"])
         category_balances = [row["carried"] + row["assigned"] + row["activity"] for row in category_rows if row["parent_id"]]
         available = sum(max(balance, 0) for balance in category_balances)
-        ready_to_assign = ready_to_assign_for_month(budget["id"], month, next_month)
+        ready_breakdown = ready_to_assign_breakdown(budget["id"], month, next_month)
+        ready_to_assign = ready_breakdown["ready"]
         for row in category_rows:
             row["quick_fund"] = min(row["underfunded"], max(ready_to_assign, 0))
         return render_template("dashboard.html", budget=budget, accounts=accounts, groups=groups,
@@ -517,6 +561,7 @@ def create_app(test_config=None):
                                transactions=transactions,
                                assigned=assigned, activity=activity, available=available,
                                ready_to_assign=ready_to_assign, today=date.today(), month=month,
+                               ready_breakdown=ready_breakdown,
                                previous_month=previous_month, next_month=next_month,
                                show_hidden=show_hidden, hidden_count=sum(row["hidden"] for row in category_rows),
                                focused_views=focused_views, focus=focus,
@@ -590,9 +635,12 @@ def create_app(test_config=None):
         current_balance = account["starting_balance_cents"] + sum(row["amount_cents"] for row in rows)
         reconciliations = db().execute("SELECT * FROM account_reconciliations WHERE account_id=? ORDER BY id DESC LIMIT 5",
                                        (account_id,)).fetchall()
+        balance_changes = db().execute("SELECT * FROM account_balance_changes WHERE account_id=? ORDER BY id DESC LIMIT 5",
+                                       (account_id,)).fetchall()
         return render_template("account.html", budget=budget, account=account, transactions=transactions, categories=categories,
                                accounts=accounts, splits=splits, cleared_balance=cleared_balance, current_balance=current_balance,
                                today=date.today(), entry_categories=categories, filters=filters, total_count=total_count,
+                               balance_changes=balance_changes,
                                payee_rules=db().execute("SELECT payee_key,display_name,category_id FROM payee_category_rules WHERE budget_id=? ORDER BY display_name", (budget["id"],)).fetchall(),
                                reconciliations=reconciliations,
                                transaction_account_id=account_id, active_view="account", active_account_id=account_id)
@@ -789,7 +837,7 @@ def create_app(test_config=None):
     @login_required
     def map_import(batch_id):
         budget = current_budget()
-        batch = db().execute("SELECT b.*,a.name account_name,a.type account_type FROM import_batches b JOIN accounts a ON a.id=b.account_id WHERE b.id=? AND b.budget_id=?", (batch_id, budget["id"])).fetchone()
+        batch = db().execute("SELECT b.*,a.name account_name,a.type account_type,a.starting_balance_date FROM import_batches b JOIN accounts a ON a.id=b.account_id WHERE b.id=? AND b.budget_id=?", (batch_id, budget["id"])).fetchone()
         if not batch:
             abort(404)
         headers = json.loads(batch["headers_json"])
@@ -852,7 +900,7 @@ def create_app(test_config=None):
     @login_required
     def review_import(batch_id):
         budget = current_budget()
-        batch = db().execute("SELECT b.*,a.name account_name,a.type account_type FROM import_batches b JOIN accounts a ON a.id=b.account_id WHERE b.id=? AND b.budget_id=?", (batch_id, budget["id"])).fetchone()
+        batch = db().execute("SELECT b.*,a.name account_name,a.type account_type,a.starting_balance_date FROM import_batches b JOIN accounts a ON a.id=b.account_id WHERE b.id=? AND b.budget_id=?", (batch_id, budget["id"])).fetchone()
         if not batch:
             abort(404)
         last_reconciliation = db().execute("SELECT MAX(statement_date) FROM account_reconciliations WHERE account_id=?",
@@ -904,7 +952,8 @@ def create_app(test_config=None):
             row["transfer_match"] = candidates[0] if candidates else None
             row["pending_transfer"] = waiting[0] if waiting else None
             row["before_reconciliation"] = bool(last_reconciliation and row["occurred_on"] <= last_reconciliation)
-            row["selected"] = bool(row["review_selected"]) if row["review_selected"] is not None else not bool(row["duplicate"] or row["before_reconciliation"])
+            row["before_starting_balance"] = bool(batch["starting_balance_date"] and row["occurred_on"] <= batch["starting_balance_date"])
+            row["selected"] = bool(row["review_selected"]) if row["review_selected"] is not None else not bool(row["duplicate"] or row["before_reconciliation"] or row["before_starting_balance"])
             if row["review_category"] is not None:
                 row["category_choice"] = row["review_category"]
             elif row["pending_leg_match"]:
@@ -1091,11 +1140,50 @@ def create_app(test_config=None):
         else:
             account_type = request.form.get("type", "checking")
             balance = money(request.form.get("balance", "0"))
-            db().execute("INSERT INTO accounts(budget_id,name,type,balance_cents,starting_balance_cents) VALUES(?,?,?,?,?)",
-                         (budget["id"], name, account_type, balance, balance))
+            balance_date = request.form.get("starting_balance_date", "").strip() or None
+            if balance_date:
+                try:
+                    datetime.strptime(balance_date, "%Y-%m-%d")
+                except ValueError:
+                    abort(400, "Invalid starting balance date")
+            db().execute("INSERT INTO accounts(budget_id,name,type,balance_cents,starting_balance_cents,starting_balance_date) VALUES(?,?,?,?,?,?)",
+                         (budget["id"], name, account_type, balance, balance, balance_date))
             db().commit()
             flash(f"Added {name}.", "success")
         return redirect(url_for("dashboard"))
+
+    @app.post("/accounts/<int:account_id>/settings")
+    @login_required
+    def update_account_settings(account_id):
+        budget = current_budget()
+        account = db().execute("SELECT * FROM accounts WHERE id=? AND budget_id=?", (account_id, budget["id"])).fetchone()
+        if not account:
+            abort(404)
+        try:
+            new_balance = money(request.form.get("starting_balance", "0"))
+            new_date = request.form.get("starting_balance_date", "").strip() or None
+            if new_date:
+                datetime.strptime(new_date, "%Y-%m-%d")
+        except ValueError:
+            abort(400, "Invalid starting balance date")
+        reason = request.form.get("reason", "").strip()
+        reconciled = db().execute("SELECT 1 FROM transactions WHERE account_id=? AND cleared=2 LIMIT 1", (account_id,)).fetchone()
+        if not reason:
+            flash("Explain why the starting balance is being corrected.", "error")
+        elif reconciled:
+            flash("This account has reconciled history. Use Reconcile with a balance adjustment instead of rewriting its starting balance.", "error")
+        elif new_balance == account["starting_balance_cents"] and new_date == account["starting_balance_date"]:
+            flash("The starting balance and date were not changed.", "error")
+        else:
+            db().execute("""INSERT INTO account_balance_changes(
+                budget_id,account_id,user_id,old_balance_cents,new_balance_cents,old_balance_date,new_balance_date,reason)
+                VALUES(?,?,?,?,?,?,?,?)""", (budget["id"], account_id, session["user_id"], account["starting_balance_cents"],
+                new_balance, account["starting_balance_date"], new_date, reason[:300]))
+            db().execute("UPDATE accounts SET starting_balance_cents=?,starting_balance_date=? WHERE id=?",
+                         (new_balance, new_date, account_id))
+            db().commit()
+            flash("Starting balance corrected and recorded in the account history.", "success")
+        return redirect(url_for("account_register", account_id=account_id))
 
     @app.post("/categories")
     @login_required

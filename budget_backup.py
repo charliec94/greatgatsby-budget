@@ -5,9 +5,9 @@ from datetime import date, datetime, timezone
 
 LEGACY_TABLES = ('accounts', 'categories', 'category_assignments', 'transactions', 'transaction_splits',
                  'category_activity', 'import_batches', 'import_rows', 'payee_category_rules', 'category_targets', 'saved_import_mappings')
-TABLES = LEGACY_TABLES + ('scheduled_transactions', 'scheduled_occurrences', 'account_reconciliations', 'money_moves')
+TABLES = LEGACY_TABLES + ('scheduled_transactions', 'scheduled_occurrences', 'account_reconciliations', 'money_moves', 'account_balance_changes')
 DIRECT = {'accounts', 'categories', 'import_batches', 'payee_category_rules', 'saved_import_mappings',
-          'scheduled_transactions', 'account_reconciliations', 'money_moves'}
+          'scheduled_transactions', 'account_reconciliations', 'money_moves', 'account_balance_changes'}
 PARENTS = {
     'categories': {'parent_id': 'categories', 'credit_account_id': 'accounts'},
     'category_assignments': {'category_id': 'categories'},
@@ -20,6 +20,7 @@ PARENTS = {
     'scheduled_transactions': {'account_id': 'accounts', 'category_id': 'categories'},
     'scheduled_occurrences': {'schedule_id': 'scheduled_transactions', 'transaction_id': 'transactions'},
     'account_reconciliations': {'account_id': 'accounts', 'adjustment_transaction_id': 'transactions'},
+    'account_balance_changes': {'account_id': 'accounts'},
 }
 
 
@@ -33,11 +34,20 @@ def normalize(payload):
                 payload['tables'][table] = []
             payload['version'] = 2
     if isinstance(payload, dict) and isinstance(payload.get('tables'), dict):
+        if payload.get('version') == 2 and 'account_balance_changes' not in payload['tables']:
+            payload = dict(payload)
+            payload['tables'] = dict(payload['tables'])
+            payload['tables']['account_balance_changes'] = []
         transactions = payload['tables'].get('transactions')
         if isinstance(transactions, list):
             for row in transactions:
                 if isinstance(row, dict) and 'pending_transfer' not in row:
                     row['pending_transfer'] = 0
+        accounts = payload['tables'].get('accounts')
+        if isinstance(accounts, list):
+            for row in accounts:
+                if isinstance(row, dict) and 'starting_balance_date' not in row:
+                    row['starting_balance_date'] = None
     return payload
 
 
@@ -58,7 +68,7 @@ def snapshot(connection, budget_id):
         else:
             predicate = 'category_id IN (SELECT id FROM categories WHERE budget_id=?)'
         data[table] = [dict(row) for row in connection.execute(f'SELECT * FROM {table} WHERE {predicate}', (budget_id,))]
-        if table in ('account_reconciliations', 'money_moves'):
+        if table in ('account_reconciliations', 'account_balance_changes', 'money_moves'):
             for row in data[table]:
                 row['user_id'] = None
     return dict(format='greatgatsby-budget', version=2, created_at=datetime.now(timezone.utc).isoformat(),
@@ -102,6 +112,8 @@ def validate(connection, payload):
                 date.fromisoformat(row['occurred_on'])
             if table == 'accounts' and row['type'] not in ('checking', 'savings', 'cash', 'credit'):
                 raise ValueError('Unknown account type.')
+            if table == 'accounts' and row['starting_balance_date']:
+                date.fromisoformat(row['starting_balance_date'])
             if table == 'category_targets':
                 if row['target_type'] not in ('monthly', 'balance', 'date') or row['amount_cents'] <= 0:
                     raise ValueError('Invalid category target.')
@@ -126,6 +138,11 @@ def validate(connection, payload):
                 date.fromisoformat(row['due_on'])
             if table == 'account_reconciliations':
                 date.fromisoformat(row['statement_date'])
+            if table == 'account_balance_changes':
+                if row['old_balance_date']:
+                    date.fromisoformat(row['old_balance_date'])
+                if row['new_balance_date']:
+                    date.fromisoformat(row['new_balance_date'])
             if table == 'money_moves':
                 changes = json.loads(row['changes_json'])
                 if not isinstance(changes, list) or not all(isinstance(c, dict) and set(c) == {'category_id', 'delta'} and type(c['category_id']) is int and type(c['delta']) is int for c in changes):

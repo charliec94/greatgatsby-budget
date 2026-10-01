@@ -2,6 +2,7 @@
 <div class="app-shell">{% include '_sidebar.html' %}<main class="workspace import-page">
 <header><div><p class="eyebrow">STEP 3 OF 3</p><h1>Review before importing.</h1><p class="muted">{{batch.filename}} → {{batch.account_name}}. Your selections save automatically. Positive cash-account income can go to Ready to Assign; matching transfers and card payments can be linked here.</p></div><span id="autosave-status" class="muted" role="status" aria-live="polite">Changes saved automatically</span></header>
 {% if last_reconciliation %}<div class="flash warning">Transactions dated on or before {{last_reconciliation}} start unchecked because that account was already reconciled. Review them carefully before importing.</div>{% endif %}
+{% if batch.starting_balance_date %}<div class="flash warning">Transactions dated on or before the {{batch.starting_balance_date}} starting-balance date begin unchecked. Importing them may count activity already included in that balance.</div>{% endif %}
 {% for category,message in get_flashed_messages(with_categories=true) %}<div class="flash {{category}}">{{message}}</div>{% endfor %}
 <form id="import-review-form" method="post" action="{{url_for('commit_import',batch_id=batch.id)}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}">
 <section class="panel import-review"><div class="review-toolbar"><label><input id="select-all" type="checkbox"> Select all non-duplicates</label><span><b id="selected-count">0</b> selected</span></div>
