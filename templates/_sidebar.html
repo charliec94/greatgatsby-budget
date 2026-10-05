@@ -15,7 +15,8 @@
     {% if is_budget_owner %}<a class="{{'active' if active_view=='backups' else ''}}" href="{{url_for('backups')}}">{{icon('backup')}}<span>Backup &amp; restore</span></a><a class="{{'active' if active_view=='household' else ''}}" href="{{url_for('household')}}">{{icon('household')}}<span>Household</span></a>{% endif %}
   </nav>
   <p class="nav-label">ACCOUNTS</p>
-  {% for a in accounts %}<a class="account {{'active' if active_account_id==a.id else ''}}" href="{{url_for('account_register',account_id=a.id)}}">{{icon('account')}}<span>{{a.name}}</span><strong>{{'${:,.2f}'.format(a.computed_balance/100)}}</strong></a>{% else %}<p class="empty-side">Add your first account</p>{% endfor %}
+  {% for a in accounts if not a.closed %}<a class="account {{'active' if active_account_id==a.id else ''}}" href="{{url_for('account_register',account_id=a.id)}}">{{icon('account')}}<span>{{a.name}}</span><strong>{{'${:,.2f}'.format(a.computed_balance/100)}}</strong></a>{% else %}<p class="empty-side">Add your first account</p>{% endfor %}
+  {% if accounts|selectattr('closed')|list %}<details class="closed-accounts"><summary>Closed accounts</summary>{% for a in accounts if a.closed %}<a class="account {{'active' if active_account_id==a.id else ''}}" href="{{url_for('account_register',account_id=a.id)}}">{{icon('account')}}<span>{{a.name}}</span><strong>{{'${:,.2f}'.format(a.computed_balance/100)}}</strong></a>{% endfor %}</details>{% endif %}
   {% if active_view=='budget' %}<button class="sidebar-action" onclick="openDialog('account-dialog')">＋ Add account</button>{% else %}<a class="sidebar-action" href="{{url_for('dashboard',open='account')}}">＋ Add account</a>{% endif %}{% endif %}
   <div class="sidebar-bottom"><span>{{session.user_name or 'Owner'}}</span><form method="post" action="{{url_for('logout')}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><button class="link-button">Sign out</button></form></div>
 </aside>

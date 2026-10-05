@@ -81,6 +81,11 @@ def create_app(test_config=None):
             # Older versions only recorded completion on the whole statement. Reopen those
             # reviews and let exact duplicate detection identify rows already committed.
             db().execute("UPDATE import_batches SET status='partial' WHERE status='imported'")
+        if "import_undo_json" not in import_row_columns:
+            db().execute("ALTER TABLE import_rows ADD COLUMN import_undo_json TEXT")
+        account_columns = {row["name"] for row in db().execute("PRAGMA table_info(accounts)")}
+        if "closed" not in account_columns:
+            db().execute("ALTER TABLE accounts ADD COLUMN closed INTEGER NOT NULL DEFAULT 0")
         db().execute(
             """INSERT OR IGNORE INTO category_assignments(category_id,month,assigned_cents)
                SELECT id, strftime('%Y-%m','now'), assigned_cents FROM categories
@@ -191,8 +196,21 @@ def create_app(test_config=None):
     def sidebar_accounts(budget_id):
         return db().execute(
             """SELECT a.*,a.starting_balance_cents+COALESCE((SELECT SUM(t.amount_cents) FROM transactions t WHERE t.account_id=a.id),0) computed_balance
-               FROM accounts a WHERE a.budget_id=? ORDER BY a.type='credit',a.name""", (budget_id,)
+               FROM accounts a WHERE a.budget_id=? ORDER BY a.closed,a.type='credit',a.name""", (budget_id,)
         ).fetchall()
+
+    def transaction_import_state(row):
+        """Keep only fields an import may change so rollback cannot overwrite later unrelated data."""
+        return {key: row[key] for key in ("occurred_on", "payee", "memo", "cleared", "pending_transfer",
+                                           "category_id", "ready_to_assign", "transfer_id")}
+
+    def record_import_undo(row_id, created_ids, updated):
+        created = []
+        for transaction_id in created_ids:
+            row = db().execute("SELECT * FROM transactions WHERE id=?", (transaction_id,)).fetchone()
+            created.append({"id": transaction_id, "after": transaction_import_state(row)})
+        payload = {"created": created, "updated": updated}
+        db().execute("UPDATE import_rows SET import_undo_json=? WHERE id=?", (json.dumps(payload), row_id))
 
     def parse_import_date(value):
         value = (value or "").strip()
@@ -505,6 +523,11 @@ def create_app(test_config=None):
         ).fetchall()
         category_rows = [dict(row) for row in rows]
         for row in category_rows:
+            # Envelope money rolls forward, but an overspent envelope starts the new
+            # month at zero. Cash overspending has already reduced cash; card
+            # overspending remains on the card balance as debt.
+            if row["parent_id"] and row["carried"] < 0:
+                row["carried"] = 0
             row["available"] = row["carried"] + row["assigned"] + row["activity"]
             row["underfunded"], row["target_progress"] = target_metrics(
                 row["target_type"], row["target_amount"], row["target_date"], row["assigned"], row["carried"], row["activity"], month
@@ -695,6 +718,55 @@ def create_app(test_config=None):
         mappings = db().execute("SELECT m.*,a.name account_name FROM saved_import_mappings m JOIN accounts a ON a.id=m.account_id WHERE m.budget_id=? ORDER BY a.name,m.name", (budget["id"],)).fetchall()
         return render_template("imports.html", budget=budget, accounts=sidebar_accounts(budget["id"]), batches=batches, mappings=mappings,
                                active_view="imports", active_account_id=None)
+
+    @app.post("/imports/<int:batch_id>/rollback")
+    @login_required
+    def rollback_import(batch_id):
+        budget = current_budget()
+        batch = db().execute("SELECT * FROM import_batches WHERE id=? AND budget_id=?", (batch_id, budget["id"])).fetchone()
+        if not batch:
+            abort(404)
+        rows = db().execute("SELECT * FROM import_rows WHERE batch_id=? AND imported=1 AND import_undo_json IS NOT NULL ORDER BY id DESC", (batch_id,)).fetchall()
+        if not rows:
+            flash("This import has no reversible transactions.", "error")
+            return redirect(url_for("imports"))
+        actions = []
+        for row in rows:
+            try:
+                action = json.loads(row["import_undo_json"])
+            except (TypeError, json.JSONDecodeError):
+                abort(409, "This import's rollback record is damaged")
+            for created in action.get("created", []):
+                transaction_id = created["id"] if isinstance(created, dict) else created
+                current = db().execute("SELECT * FROM transactions WHERE id=?", (transaction_id,)).fetchone()
+                if not current:
+                    abort(409, "A transaction from this import was already removed")
+                if isinstance(created, dict) and transaction_import_state(current) != created["after"]:
+                    abort(409, "An imported transaction changed after import. Undo that later change before rolling back this import.")
+                if current["account_id"] not in {a["id"] for a in db().execute("SELECT id FROM accounts WHERE budget_id=?", (budget["id"],))}:
+                    abort(409, "An imported transaction no longer belongs to this budget")
+            for change in action.get("updated", []):
+                current = db().execute("SELECT * FROM transactions WHERE id=?", (change["id"],)).fetchone()
+                if not current or transaction_import_state(current) != change["after"]:
+                    abort(409, "A linked transfer changed after import. Undo that later change before rolling back this import.")
+            actions.append((row, action))
+        for row, action in actions:
+            for created in action.get("created", []):
+                transaction_id = created["id"] if isinstance(created, dict) else created
+                db().execute("DELETE FROM category_activity WHERE transaction_id=?", (transaction_id,))
+                db().execute("DELETE FROM transaction_splits WHERE transaction_id=?", (transaction_id,))
+                db().execute("DELETE FROM scheduled_occurrences WHERE transaction_id=?", (transaction_id,))
+                db().execute("DELETE FROM transactions WHERE id=?", (transaction_id,))
+            for change in action.get("updated", []):
+                before = change["before"]
+                assignments = ",".join(f"{key}=?" for key in before)
+                db().execute(f"UPDATE transactions SET {assignments} WHERE id=?", (*before.values(), change["id"]))
+            db().execute("UPDATE import_rows SET imported=0,review_selected=0,import_undo_json=NULL WHERE id=?", (row["id"],))
+        db().execute("UPDATE import_batches SET status='review' WHERE id=?", (batch_id,))
+        rebuild_credit_activity(budget["id"])
+        db().commit()
+        flash(f"Rolled back {len(actions)} imported transaction{'s' if len(actions) != 1 else ''}. You can review and import them again.", "success")
+        return redirect(url_for("review_import", batch_id=batch_id))
 
     @app.get("/uncategorized")
     @login_required
@@ -1093,35 +1165,47 @@ def create_app(test_config=None):
             # A categorized statement row represents a posted bank transaction. Keep
             # uncategorized rows uncleared so they remain visibly pending review.
             imported_cleared = 1 if choice else 0
+            created_ids, updated_transactions = [], []
             if pending_transfer_match:
+                before = transaction_import_state(pending_transfer_match)
                 db().execute("""UPDATE transactions SET occurred_on=?,payee=?,memo=?,cleared=1,pending_transfer=0,
                     category_id=NULL,ready_to_assign=0 WHERE id=?""",
                     (row["occurred_on"], row["payee"], row["memo"], pending_transfer_match["id"]))
+                after = db().execute("SELECT * FROM transactions WHERE id=?", (pending_transfer_match["id"],)).fetchone()
+                updated_transactions.append({"id": pending_transfer_match["id"], "before": before, "after": transaction_import_state(after)})
             elif new_transfer_target:
                 transfer_id = secrets.token_urlsafe(12)
                 imported_payee = f"Transfer to {new_transfer_target['name']}" if row["amount_cents"] < 0 else f"Transfer from {new_transfer_target['name']}"
                 pending_payee = f"Transfer from {batch['account_name']}" if row["amount_cents"] < 0 else f"Transfer to {batch['account_name']}"
-                db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id,ready_to_assign,pending_transfer)
+                cursor = db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id,ready_to_assign,pending_transfer)
                     VALUES(?,NULL,?,?,?,?,1,?,0,0)""", (batch["account_id"], row["occurred_on"], imported_payee,
                     row["memo"], row["amount_cents"], transfer_id))
-                db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id,ready_to_assign,pending_transfer)
+                created_ids.append(cursor.lastrowid)
+                cursor = db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id,ready_to_assign,pending_transfer)
                     VALUES(?,NULL,?,?,?,?,0,?,0,1)""", (new_transfer_target["id"], row["occurred_on"], pending_payee,
                     "Waiting for statement import", -row["amount_cents"], transfer_id))
+                created_ids.append(cursor.lastrowid)
             elif transfer_match:
                 transfer_id = secrets.token_urlsafe(12)
                 imported_payee = f"Transfer to {transfer_match['account_name']}" if row["amount_cents"] < 0 else f"Transfer from {transfer_match['account_name']}"
                 existing_payee = f"Transfer to {batch['account_name']}" if transfer_match["amount_cents"] < 0 else f"Transfer from {batch['account_name']}"
+                before = transaction_import_state(transfer_match)
                 db().execute("UPDATE transactions SET transfer_id=?,payee=?,category_id=NULL,ready_to_assign=0 WHERE id=?",
                              (transfer_id, existing_payee, transfer_match["id"]))
-                db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id,ready_to_assign)
+                after = db().execute("SELECT * FROM transactions WHERE id=?", (transfer_match["id"],)).fetchone()
+                updated_transactions.append({"id": transfer_match["id"], "before": before, "after": transaction_import_state(after)})
+                cursor = db().execute("""INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,transfer_id,ready_to_assign)
                     VALUES(?,NULL,?,?,?,?,1,?,0)""", (batch["account_id"], row["occurred_on"], imported_payee,
                     row["memo"], row["amount_cents"], transfer_id))
+                created_ids.append(cursor.lastrowid)
             else:
-                db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,ready_to_assign) VALUES(?,?,?,?,?,?,?,?)",
-                             (batch["account_id"], category_id if valid else None, row["occurred_on"], row["payee"], row["memo"], row["amount_cents"], imported_cleared, ready_to_assign))
+                cursor = db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,ready_to_assign) VALUES(?,?,?,?,?,?,?,?)",
+                                      (batch["account_id"], category_id if valid else None, row["occurred_on"], row["payee"], row["memo"], row["amount_cents"], imported_cleared, ready_to_assign))
+                created_ids.append(cursor.lastrowid)
             if valid:
                 remember_payee_category(budget["id"], row["payee"], category_id)
             db().execute("UPDATE import_rows SET imported=1,review_selected=0,review_category=? WHERE id=?", (choice, row["id"]))
+            record_import_undo(row["id"], created_ids, updated_transactions)
             imported += 1
         remaining = db().execute("SELECT COUNT(*) FROM import_rows WHERE batch_id=? AND imported=0", (batch_id,)).fetchone()[0]
         db().execute("UPDATE import_batches SET status=? WHERE id=?", ("partial" if remaining else "imported", batch_id))
@@ -1183,6 +1267,27 @@ def create_app(test_config=None):
                          (new_balance, new_date, account_id))
             db().commit()
             flash("Starting balance corrected and recorded in the account history.", "success")
+        return redirect(url_for("account_register", account_id=account_id))
+
+    @app.post("/accounts/<int:account_id>/closed")
+    @login_required
+    def set_account_closed(account_id):
+        budget = current_budget()
+        account = db().execute("""SELECT a.*,a.starting_balance_cents+COALESCE((SELECT SUM(amount_cents)
+            FROM transactions WHERE account_id=a.id),0) computed_balance FROM accounts a
+            WHERE a.id=? AND a.budget_id=?""", (account_id, budget["id"])).fetchone()
+        if not account:
+            abort(404)
+        close = request.form.get("closed") == "1"
+        pending = db().execute("SELECT COUNT(*) FROM transactions WHERE account_id=? AND pending_transfer=1", (account_id,)).fetchone()[0]
+        if close and account["computed_balance"] != 0:
+            flash("Bring the account balance to $0.00 before closing it. Record a transfer or balance adjustment first.", "error")
+        elif close and pending:
+            flash("Resolve pending transfers before closing this account.", "error")
+        else:
+            db().execute("UPDATE accounts SET closed=? WHERE id=?", (1 if close else 0, account_id))
+            db().commit()
+            flash(f"{account['name']} {'closed' if close else 'reopened'}. Its history is preserved.", "success")
         return redirect(url_for("account_register", account_id=account_id))
 
     @app.post("/categories")
@@ -1460,7 +1565,7 @@ def create_app(test_config=None):
             flash("Account, payee, and either an outflow or inflow are required.", "error")
         else:
             budget = current_budget()
-            account = db().execute("SELECT * FROM accounts WHERE id=? AND budget_id=?", (account_id, budget["id"])).fetchone()
+            account = db().execute("SELECT * FROM accounts WHERE id=? AND budget_id=? AND closed=0", (account_id, budget["id"])).fetchone()
             category_id = request.form.get("category_id") or None
             category = db().execute("SELECT * FROM categories WHERE id=? AND budget_id=? AND parent_id IS NOT NULL AND kind='spending'", (category_id, budget["id"])).fetchone() if category_id else None
             if not account or (category_id and not category):
@@ -1766,14 +1871,14 @@ def money(value):
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS budgets(id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES users(id), name TEXT NOT NULL, currency TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), name TEXT NOT NULL, type TEXT NOT NULL, balance_cents INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), name TEXT NOT NULL, type TEXT NOT NULL, balance_cents INTEGER NOT NULL DEFAULT 0, starting_balance_cents INTEGER NOT NULL DEFAULT 0, starting_balance_date TEXT, closed INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), parent_id INTEGER REFERENCES categories(id), name TEXT NOT NULL, assigned_cents INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS category_assignments(id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL REFERENCES categories(id), month TEXT NOT NULL, assigned_cents INTEGER NOT NULL DEFAULT 0, UNIQUE(category_id,month));
 CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id), category_id INTEGER REFERENCES categories(id), occurred_on TEXT NOT NULL, payee TEXT NOT NULL, memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL, cleared INTEGER NOT NULL DEFAULT 0, ready_to_assign INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS category_activity(id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL REFERENCES categories(id), transaction_id INTEGER REFERENCES transactions(id), occurred_on TEXT NOT NULL, amount_cents INTEGER NOT NULL, kind TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS transaction_splits(id INTEGER PRIMARY KEY, transaction_id INTEGER NOT NULL REFERENCES transactions(id), category_id INTEGER NOT NULL REFERENCES categories(id), memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS import_batches(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), account_id INTEGER NOT NULL REFERENCES accounts(id), filename TEXT NOT NULL, headers_json TEXT NOT NULL, rows_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'mapping', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS import_rows(id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE, occurred_on TEXT NOT NULL, payee TEXT NOT NULL, memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL, review_selected INTEGER, review_category TEXT, imported INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS import_rows(id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE, occurred_on TEXT NOT NULL, payee TEXT NOT NULL, memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL, review_selected INTEGER, review_category TEXT, imported INTEGER NOT NULL DEFAULT 0, import_undo_json TEXT);
 CREATE TABLE IF NOT EXISTS payee_category_rules(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), payee_key TEXT NOT NULL, display_name TEXT NOT NULL, category_id INTEGER NOT NULL REFERENCES categories(id), UNIQUE(budget_id,payee_key));
 CREATE TABLE IF NOT EXISTS category_targets(id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL UNIQUE REFERENCES categories(id) ON DELETE CASCADE, target_type TEXT NOT NULL, amount_cents INTEGER NOT NULL, target_date TEXT, due_day INTEGER);
 CREATE TABLE IF NOT EXISTS saved_import_mappings(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL, header_signature TEXT NOT NULL, headers_json TEXT NOT NULL, mapping_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(account_id,header_signature));

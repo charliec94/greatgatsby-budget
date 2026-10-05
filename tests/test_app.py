@@ -108,6 +108,30 @@ def test_ready_to_assign_picker_and_cover_overspending(tmp_path):
     connection.close()
 
 
+def test_overspent_envelope_resets_at_month_boundary(tmp_path):
+    client = make_client(tmp_path)
+    client.post("/setup", data={"csrf_token": token(client), "name": "Charlie", "email": "charlie@example.com", "password": "a-strong-password"})
+    csrf = token(client, "/")
+    client.post("/accounts", data={"csrf_token": csrf, "name": "Checking", "type": "checking", "balance": "500"})
+    client.post("/categories", data={"csrf_token": csrf, "name": "Living", "month": "2026-09"})
+    connection = sqlite3.connect(tmp_path / "test.db")
+    account_id = connection.execute("SELECT id FROM accounts WHERE name='Checking'").fetchone()[0]
+    group_id = connection.execute("SELECT id FROM categories WHERE name='Living'").fetchone()[0]
+    connection.close()
+    client.post("/categories", data={"csrf_token": csrf, "name": "Food", "parent_id": group_id, "month": "2026-09"})
+    connection = sqlite3.connect(tmp_path / "test.db")
+    category_id = connection.execute("SELECT id FROM categories WHERE name='Food'").fetchone()[0]
+    connection.close()
+    client.post("/transactions", data={"csrf_token": csrf, "account_id": account_id, "category_id": category_id,
+        "occurred_on": "2026-09-30", "payee": "Market", "amount": "-75"})
+    september = client.get("/?month=2026-09")
+    assert b'aria-label="Assigned to Food"' in september.data and b"$-75.00" in september.data
+    october = client.get("/?month=2026-10")
+    assert b'aria-label="Assigned to Food"' in october.data
+    food_row = october.data.split("↳ Food".encode(), 1)[1].split(b'</div>', 1)[0]
+    assert b"$0.00" in food_row and b"$-75.00" not in food_row
+
+
 def test_ready_breakdown_and_audited_starting_balance_correction(tmp_path):
     client = make_client(tmp_path)
     client.post("/setup", data={"csrf_token": token(client), "name": "Charlie", "email": "charlie@example.com", "password": "a-strong-password"})

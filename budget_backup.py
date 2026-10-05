@@ -48,6 +48,13 @@ def normalize(payload):
             for row in accounts:
                 if isinstance(row, dict) and 'starting_balance_date' not in row:
                     row['starting_balance_date'] = None
+                if isinstance(row, dict) and 'closed' not in row:
+                    row['closed'] = 0
+        import_rows = payload['tables'].get('import_rows')
+        if isinstance(import_rows, list):
+            for row in import_rows:
+                if isinstance(row, dict) and 'import_undo_json' not in row:
+                    row['import_undo_json'] = None
     return payload
 
 
@@ -127,6 +134,10 @@ def validate(connection, payload):
                     raise ValueError('Invalid import headers.')
                 if not isinstance(raw_rows, list) or not raw_rows or not all(isinstance(r, dict) and all(isinstance(v, str) for v in r.values()) for r in raw_rows):
                     raise ValueError('Invalid import rows.')
+            if table == 'import_rows' and row['import_undo_json']:
+                undo = json.loads(row['import_undo_json'])
+                if not isinstance(undo, dict) or set(undo) != {'created', 'updated'}:
+                    raise ValueError('Invalid import rollback record.')
             if table == 'saved_import_mappings':
                 if not isinstance(json.loads(row['headers_json']), list) or not isinstance(json.loads(row['mapping_json']), dict):
                     raise ValueError('Invalid saved mapping.')

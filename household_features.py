@@ -178,9 +178,19 @@ def register_features(app, db, current_budget, login_required, sidebar_accounts)
         groups = defaultdict(int)
         for row in breakdown:
             groups[row['group']] += row['net']
+        account_balances = db().execute('''SELECT a.id,a.name,a.type,a.closed,a.starting_balance_cents+
+            COALESCE((SELECT SUM(t.amount_cents) FROM transactions t WHERE t.account_id=a.id AND t.occurred_on<=?),0) balance
+            FROM accounts a WHERE a.budget_id=? ORDER BY a.type='credit',a.name''',
+            (end.isoformat(), ctx['budget']['id'])).fetchall()
+        assets = sum(max(row['balance'], 0) for row in account_balances if row['type'] != 'credit')
+        cash_debt = sum(min(row['balance'], 0) for row in account_balances if row['type'] != 'credit')
+        credit_debt = sum(min(row['balance'], 0) for row in account_balances if row['type'] == 'credit')
+        net_worth = sum(row['balance'] for row in account_balances)
         return render_template('reports.html', **ctx, start=start, end=end, account_id=account_id,
                                income=income, spending=spending, refunds=refunds, breakdown=breakdown,
-                               groups=dict(groups), monthly=monthly, net=income-spending+refunds)
+                               groups=dict(groups), monthly=monthly, net=income-spending+refunds,
+                               account_balances=account_balances, assets=assets, cash_debt=cash_debt,
+                               credit_debt=credit_debt, net_worth=net_worth)
 
     @app.get('/backups')
     @owner_required

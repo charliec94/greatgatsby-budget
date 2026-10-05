@@ -87,3 +87,36 @@ def test_uncategorized_csv_import_stays_uncleared(tmp_path):
     connection = sqlite3.connect(tmp_path / "test.db")
     assert connection.execute("SELECT category_id,ready_to_assign,cleared FROM transactions WHERE payee='Market'").fetchone() == (None, 0, 0)
     connection.close()
+
+
+def test_import_batch_can_be_rolled_back_and_reviewed_again(tmp_path):
+    client, csrf, account_id, _group_id, grocery_id, batch_id, rows = prepared_import(tmp_path)
+    client.post(f"/imports/{batch_id}/commit", data={"csrf_token": csrf, "selected": str(rows["Market"]),
+        f"category_{rows['Market']}": str(grocery_id)})
+    connection = sqlite3.connect(tmp_path / "test.db")
+    assert connection.execute("SELECT COUNT(*) FROM transactions WHERE account_id=?", (account_id,)).fetchone()[0] == 1
+    assert connection.execute("SELECT import_undo_json FROM import_rows WHERE id=?", (rows["Market"],)).fetchone()[0]
+    connection.close()
+
+    rolled_back = client.post(f"/imports/{batch_id}/rollback", data={"csrf_token": csrf}, follow_redirects=True)
+    assert b"Rolled back 1 imported transaction" in rolled_back.data
+    connection = sqlite3.connect(tmp_path / "test.db")
+    assert connection.execute("SELECT COUNT(*) FROM transactions WHERE account_id=?", (account_id,)).fetchone()[0] == 0
+    assert connection.execute("SELECT imported,import_undo_json FROM import_rows WHERE id=?", (rows["Market"],)).fetchone() == (0, None)
+    assert connection.execute("SELECT status FROM import_batches WHERE id=?", (batch_id,)).fetchone()[0] == "review"
+    connection.close()
+
+
+def test_import_rollback_refuses_to_delete_a_later_edited_transaction(tmp_path):
+    client, csrf, _account_id, _group_id, grocery_id, batch_id, rows = prepared_import(tmp_path)
+    client.post(f"/imports/{batch_id}/commit", data={"csrf_token": csrf, "selected": str(rows["Market"]),
+        f"category_{rows['Market']}": str(grocery_id)})
+    connection = sqlite3.connect(tmp_path / "test.db")
+    connection.execute("UPDATE transactions SET memo='Added after import' WHERE payee='Market'")
+    connection.commit()
+    connection.close()
+    blocked = client.post(f"/imports/{batch_id}/rollback", data={"csrf_token": csrf})
+    assert blocked.status_code == 409
+    connection = sqlite3.connect(tmp_path / "test.db")
+    assert connection.execute("SELECT memo FROM transactions WHERE payee='Market'").fetchone()[0] == "Added after import"
+    connection.close()

@@ -13,6 +13,10 @@ CREATE TABLE IF NOT EXISTS account_reconciliations(id INTEGER PRIMARY KEY,budget
 CREATE TABLE IF NOT EXISTS account_balance_changes(id INTEGER PRIMARY KEY,budget_id INTEGER NOT NULL REFERENCES budgets(id) ON DELETE CASCADE,account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,old_balance_cents INTEGER NOT NULL,new_balance_cents INTEGER NOT NULL,old_balance_date TEXT,new_balance_date TEXT,reason TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS money_moves(id INTEGER PRIMARY KEY,budget_id INTEGER NOT NULL REFERENCES budgets(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,month TEXT NOT NULL,description TEXT NOT NULL,changes_json TEXT NOT NULL,undone_at TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS focused_views(id INTEGER PRIMARY KEY,budget_id INTEGER NOT NULL REFERENCES budgets(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,name TEXT NOT NULL,category_ids_json TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS transaction_audit(id INTEGER PRIMARY KEY,budget_id INTEGER NOT NULL REFERENCES budgets(id) ON DELETE CASCADE,transaction_id INTEGER,operation TEXT NOT NULL,snapshot_json TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TRIGGER IF NOT EXISTS transaction_audit_insert AFTER INSERT ON transactions BEGIN INSERT INTO transaction_audit(budget_id,transaction_id,operation,snapshot_json) SELECT a.budget_id,NEW.id,'created',json_object('account_id',NEW.account_id,'category_id',NEW.category_id,'occurred_on',NEW.occurred_on,'payee',NEW.payee,'memo',NEW.memo,'amount_cents',NEW.amount_cents,'cleared',NEW.cleared,'ready_to_assign',NEW.ready_to_assign,'transfer_id',NEW.transfer_id) FROM accounts a WHERE a.id=NEW.account_id; END;
+CREATE TRIGGER IF NOT EXISTS transaction_audit_update AFTER UPDATE ON transactions BEGIN INSERT INTO transaction_audit(budget_id,transaction_id,operation,snapshot_json) SELECT a.budget_id,NEW.id,'updated',json_object('account_id',NEW.account_id,'category_id',NEW.category_id,'occurred_on',NEW.occurred_on,'payee',NEW.payee,'memo',NEW.memo,'amount_cents',NEW.amount_cents,'cleared',NEW.cleared,'ready_to_assign',NEW.ready_to_assign,'transfer_id',NEW.transfer_id) FROM accounts a WHERE a.id=NEW.account_id; END;
+CREATE TRIGGER IF NOT EXISTS transaction_audit_delete AFTER DELETE ON transactions BEGIN INSERT INTO transaction_audit(budget_id,transaction_id,operation,snapshot_json) SELECT a.budget_id,OLD.id,'deleted',json_object('account_id',OLD.account_id,'category_id',OLD.category_id,'occurred_on',OLD.occurred_on,'payee',OLD.payee,'memo',OLD.memo,'amount_cents',OLD.amount_cents,'cleared',OLD.cleared,'ready_to_assign',OLD.ready_to_assign,'transfer_id',OLD.transfer_id) FROM accounts a WHERE a.id=OLD.account_id; END;
 """
 
 
@@ -93,8 +97,58 @@ def register_planning_features(app, db, current_budget, login_required, sidebar_
                              (budget["id"], session["user_id"])).fetchall()
         moves = db().execute("""SELECT m.*,u.name user_name FROM money_moves m LEFT JOIN users u ON u.id=m.user_id
             WHERE m.budget_id=? ORDER BY m.id DESC LIMIT 30""", (budget["id"],)).fetchall()
+        payee_rules = db().execute("""SELECT r.*,c.name category_name,p.name parent_name FROM payee_category_rules r
+            JOIN categories c ON c.id=r.category_id JOIN categories p ON p.id=c.parent_id
+            WHERE r.budget_id=? ORDER BY r.display_name""", (budget["id"],)).fetchall()
+        pending_transfers = db().execute("""SELECT t.*,a.name account_name,other.name other_account_name
+            FROM transactions t JOIN accounts a ON a.id=t.account_id
+            JOIN transactions pair ON pair.transfer_id=t.transfer_id AND pair.id!=t.id
+            JOIN accounts other ON other.id=pair.account_id
+            WHERE a.budget_id=? AND t.pending_transfer=1 ORDER BY t.occurred_on,t.id""", (budget["id"],)).fetchall()
+        audits = db().execute("""SELECT operation,transaction_id,created_at,
+            json_extract(snapshot_json,'$.payee') payee,json_extract(snapshot_json,'$.amount_cents') amount_cents,
+            json_extract(snapshot_json,'$.occurred_on') occurred_on FROM transaction_audit
+            WHERE budget_id=? ORDER BY id DESC LIMIT 30""", (budget["id"],)).fetchall()
+        alerts = []
+        uncategorized = db().execute("""SELECT COUNT(*) FROM transactions t JOIN accounts a ON a.id=t.account_id
+            WHERE a.budget_id=? AND t.category_id IS NULL AND t.transfer_id IS NULL AND t.ready_to_assign=0
+            AND NOT EXISTS(SELECT 1 FROM transaction_splits s WHERE s.transaction_id=t.id)""", (budget["id"],)).fetchone()[0]
+        if uncategorized:
+            alerts.append((f"{uncategorized} transaction{'s' if uncategorized != 1 else ''} need categories", "uncategorized"))
+        if pending_transfers:
+            alerts.append((f"{len(pending_transfers)} transfer{'s' if len(pending_transfers) != 1 else ''} await another statement", "planning"))
+        due_soon = db().execute("SELECT COUNT(*) FROM scheduled_transactions WHERE budget_id=? AND active=1 AND next_due BETWEEN ? AND ?",
+                                (budget["id"], date.today().isoformat(), (date.today()+timedelta(days=7)).isoformat())).fetchone()[0]
+        if due_soon:
+            alerts.append((f"{due_soon} scheduled transaction{'s are' if due_soon != 1 else ' is'} due in the next 7 days", "planning"))
         return render_template("planning.html", schedules=schedules, categories=categories, views=views, moves=moves,
+                               payee_rules=payee_rules, pending_transfers=pending_transfers, audits=audits, alerts=alerts,
                                today=date.today().isoformat(), **context())
+
+    @app.post("/payee-rules/<int:rule_id>")
+    @login_required
+    def update_payee_rule(rule_id):
+        budget = current_budget()
+        rule = db().execute("SELECT * FROM payee_category_rules WHERE id=? AND budget_id=?", (rule_id, budget["id"])).fetchone()
+        category_id = request.form.get("category_id", type=int)
+        category = db().execute("SELECT 1 FROM categories WHERE id=? AND budget_id=? AND parent_id IS NOT NULL AND kind='spending'",
+                                (category_id, budget["id"])).fetchone()
+        if not rule or not category:
+            abort(404)
+        display_name = request.form.get("display_name", "").strip() or rule["display_name"]
+        db().execute("UPDATE payee_category_rules SET display_name=?,category_id=? WHERE id=?", (display_name[:200], category_id, rule_id))
+        db().commit()
+        flash("Payee rule updated.", "success")
+        return redirect(url_for("planning"))
+
+    @app.post("/payee-rules/<int:rule_id>/delete")
+    @login_required
+    def delete_payee_rule(rule_id):
+        budget = current_budget()
+        db().execute("DELETE FROM payee_category_rules WHERE id=? AND budget_id=?", (rule_id, budget["id"]))
+        db().commit()
+        flash("Payee rule removed. Existing transactions were not changed.", "success")
+        return redirect(url_for("planning"))
 
     @app.post("/scheduled")
     @login_required
@@ -172,6 +226,9 @@ def register_planning_features(app, db, current_budget, login_required, sidebar_
                 value["due"] = min(value["due"], first_due)
         raw = []
         for row in rows:
+            row = dict(row)
+            if row["carried"] < 0:
+                row["carried"] = 0
             available = row["carried"] + row["assigned"] + row["activity"]
             target_need, _ = target_metrics(row["target_type"], row["target_amount"], row["target_date"],
                                             row["assigned"], row["carried"], row["activity"], month)

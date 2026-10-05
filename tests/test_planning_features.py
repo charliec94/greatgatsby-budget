@@ -88,3 +88,26 @@ def test_reconciliation_history_and_optional_adjustment(tmp_path):
     review = client.get(f'/imports/{batch}/review')
     assert b'account was already reconciled' in review.data
     assert f'name="selected" value="{row}" checked'.encode() not in review.data
+
+
+def test_planning_review_tools_audit_payees_and_account_lifecycle(tmp_path):
+    client, csrf, account, category = owner(tmp_path)
+    today = date.today().isoformat()
+    client.post('/transactions', data={'csrf_token': csrf, 'account_id': account, 'payee': 'Corner Market',
+        'amount': '-20', 'occurred_on': today, 'category_id': category})
+    planning = client.get('/planning')
+    assert b'Payee rules' in planning.data and b'Corner Market' in planning.data
+    assert b'Transaction audit' in planning.data and b'Created' in planning.data
+    connection = sqlite3.connect(tmp_path / 'test.db')
+    assert connection.execute("SELECT COUNT(*) FROM transaction_audit WHERE operation='created'").fetchone()[0] == 1
+    connection.close()
+
+    client.post('/accounts', data={'csrf_token': csrf, 'name': 'Old Wallet', 'type': 'cash', 'balance': '0'})
+    connection = sqlite3.connect(tmp_path / 'test.db')
+    wallet = connection.execute("SELECT id FROM accounts WHERE name='Old Wallet'").fetchone()[0]
+    connection.close()
+    closed = client.post(f'/accounts/{wallet}/closed', data={'csrf_token': csrf, 'closed': '1'}, follow_redirects=True)
+    assert b'Old Wallet closed' in closed.data and b'CLOSED' in closed.data
+    assert b'Closed accounts' in closed.data
+    reopened = client.post(f'/accounts/{wallet}/closed', data={'csrf_token': csrf, 'closed': '0'}, follow_redirects=True)
+    assert b'Old Wallet reopened' in reopened.data

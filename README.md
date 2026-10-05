@@ -45,12 +45,14 @@ For anything beyond temporary laptop testing, copy `.env.example` to `.env` and 
 
 ## Reports, backups, and household access
 
-- **Reports** provides spending by group/subcategory, monthly income versus net spending, and date/account filters. Linked transfers and credit-card payments are excluded; split purchases are counted once. Uncategorized inflows are treated as income and categorized inflows as refunds. Unmatched payment imports must be linked first. Refunds can produce negative net spending.
+- **Reports** provides net worth by account, spending by group/subcategory, monthly income versus net spending, and date/account filters. Linked transfers and credit-card payments are excluded; split purchases are counted once. Uncategorized inflows are treated as income and categorized inflows as refunds. Unmatched payment imports must be linked first. Refunds can produce negative net spending.
 - **Planning tools** provides weekly, biweekly, and monthly scheduled transactions, personal custom Focused Views, and a Recent Money Moves ledger with compensating undo. Due schedules enter the account register once and then advance to their next date.
 - **Auto-Assign** always presents a preview. It prioritizes overspending, upcoming scheduled outflows, and targets, and never assigns more than Ready to Assign.
 - **Ready to Assign** expands into a complete cash-minus-funded-categories breakdown, including per-account cash, current-month assignments, income, overspending, and future assignments.
 - **Account settings** can correct a starting balance and its statement date before reconciliation. Every correction requires a reason and is retained in account history; reconciled accounts must use an explicit reconciliation adjustment instead. Imports on or before a recorded starting-balance date begin unchecked to reduce double-counting risk.
 - **Reconciliation** records statement dates and balances, locks cleared transactions through that date, and optionally creates an explicit balance-adjustment transaction. Import rows on or before the last reconciliation start unchecked.
+- **Import history** records the transactions created or linked by each new statement. A batch can be rolled back and reviewed again; rollback stops if a linked transaction was edited later.
+- **Planning tools** includes a pending-transfer queue, editable learned payee rules, reminders for work that needs review, and a local transaction audit feed. Accounts at exactly zero can be closed without deleting their history and reopened later.
 - **Backup & restore** is owner-only. Download a versioned JSON financial backup and store it somewhere secure/off the NAS. It includes scheduled transactions, reconciliation history, money moves, import drafts, and financial information in plain text, but no login passwords, memberships, invitation tokens, personal Focused Views, or email credentials. It is not a full installation backup. On a new installation, create an owner first and restore the financial backup; invite members again.
 - Restore accepts backups up to 5 MB, requires the owner password and typing `RESTORE`, validates in an isolated database, then replaces financial data in a transaction. A mandatory pre-restore copy is saved under `data/backups` (or `/data/backups` in Docker). These recovery files are excluded from Git and the image; keep additional off-device backups yourself. Household access and SMTP settings are preserved. Only use trusted backups from this app version.
 - **Household** is owner-only. Members have shared read/write access to the budget and reports, not invitations or backup/restore. Removing a member blocks their next budget request. Links expire after seven days and can only be accepted once. Reissuing an invite for the same address revokes earlier pending links.
@@ -96,7 +98,7 @@ docker build -t ghcr.io/charliec94/greatgatsby-budget:0.1.0 .
 docker push ghcr.io/charliec94/greatgatsby-budget:0.1.0
 ```
 
-For Unraid, map host port `8081` to container port `8000` and map `/mnt/user/appdata/greatgatsby-budget` to `/data`.
+For Unraid, use [`unraid/greatgatsby-budget.xml`](unraid/greatgatsby-budget.xml) or `compose.unraid.yaml`. Both map host port `8081` to container port `8000` and explicitly bind `/mnt/user/appdata/greatgatsby-budget` to `/data` read/write. Appdata is a **Path** mapping, not an environment variable. Preserve any existing container data before adding or changing this mapping.
 
 ### Per-container Tailscale on Unraid
 
@@ -108,4 +110,6 @@ For the Unraid container icon, use:
 https://raw.githubusercontent.com/charliec94/greatgatsby-budget/main/assets/greatgatsby-budget-icon.png
 ```
 
-The image runs as the non-root `app` user by default. If Unraid's Tailscale hook reports that it lacks root privileges, set the container's Extra Parameters to `--user 0`. After applying the template, verify `docker exec YNAB tailscale serve status`. If it reports `No serve config`, run `docker exec -u 0 YNAB tailscale serve --bg http://127.0.0.1:8000` once.
+The image runs as the non-root `app` user by default. The supplied Unraid template starts as root so the native Tailscale hook can initialize, then the image entrypoint drops the application process back to `app`; it deliberately excludes `/data/.tailscale_state` from recursive ownership changes. Authenticate Tailscale before expecting the app to start normally.
+
+An image update does not apply later XML template changes to an already installed container. Recreate or edit the container when the template changes. Then verify the exact container name with `docker exec GreatGatsby-Budget tailscale status` and `docker exec GreatGatsby-Budget tailscale serve status`. If Serve reports `No serve config`, run `docker exec -u 0 GreatGatsby-Budget tailscale serve --bg http://127.0.0.1:8000` once. Also confirm `/health`, the `/data` mount, login/data persistence after recreation, and that Funnel remains disabled.

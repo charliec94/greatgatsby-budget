@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>GreatGatsby-Budget</Name>
+  <Repository>ghcr.io/charliec94/greatgatsby-budget:latest</Repository>
+  <Registry>https://github.com/charliec94/greatgatsby-budget/pkgs/container/greatgatsby-budget</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/charliec94/greatgatsby-budget</Support>
+  <Project>https://github.com/charliec94/greatgatsby-budget</Project>
+  <Overview>Private, envelope-based household budgeting with local CSV imports.</Overview>
+  <Category>Productivity: Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8000]</WebUI>
+  <Icon>https://raw.githubusercontent.com/charliec94/greatgatsby-budget/main/assets/greatgatsby-budget-icon.png</Icon>
+  <ExtraParams>--user 0</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>Authenticate the native Unraid Tailscale integration before app startup. Funnel must remain disabled.</Requires>
+  <TailscaleEnabled>true</TailscaleEnabled>
+  <TailscaleHostname>greatgatsby-budget</TailscaleHostname>
+  <TailscaleStateDir>/data/.tailscale_state</TailscaleStateDir>
+  <TailscaleServe>true</TailscaleServe>
+  <TailscaleServeProtocol>http</TailscaleServeProtocol>
+  <TailscaleServePort>8000</TailscaleServePort>
+  <TailscaleFunnel>false</TailscaleFunnel>
+  <Config Name="Web UI" Target="8000" Default="8081" Mode="tcp" Description="Host port for the LAN web interface" Type="Port" Display="always" Required="true" Mask="false">8081</Config>
+  <Config Name="Appdata" Target="/data" Default="/mnt/user/appdata/greatgatsby-budget" Mode="rw" Description="Persistent database, backups, and Tailscale state. This is a Path mapping." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/greatgatsby-budget</Config>
+  <Config Name="App secret key" Target="APP_SECRET_KEY" Default="" Mode="" Description="Long random secret used for login sessions" Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Public base URL" Target="APP_BASE_URL" Default="" Mode="" Description="Optional private Tailscale URL used in invitation links" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>
