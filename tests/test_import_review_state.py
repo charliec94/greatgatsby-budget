@@ -120,3 +120,17 @@ def test_import_rollback_refuses_to_delete_a_later_edited_transaction(tmp_path):
     connection = sqlite3.connect(tmp_path / "test.db")
     assert connection.execute("SELECT memo FROM transactions WHERE payee='Market'").fetchone()[0] == "Added after import"
     connection.close()
+
+
+def test_contains_payee_rule_suggests_category_and_renames_import(tmp_path):
+    client, csrf, _account_id, _group_id, grocery_id, batch_id, rows = prepared_import(tmp_path)
+    created = client.post('/payee-rules', data={'csrf_token': csrf, 'match_type': 'contains',
+        'match_value': 'market', 'category_id': grocery_id, 'rename_to': 'Neighborhood Market'}, follow_redirects=True)
+    assert b'Payee rule created' in created.data
+    review = client.get(f'/imports/{batch_id}/review')
+    assert f'value="{grocery_id}" selected'.encode() in review.data
+    client.post(f'/imports/{batch_id}/commit', data={'csrf_token': csrf, 'selected': str(rows['Market']),
+        f'category_{rows["Market"]}': str(grocery_id)})
+    connection = sqlite3.connect(tmp_path / 'test.db')
+    assert connection.execute("SELECT payee,category_id FROM transactions").fetchone() == ('Neighborhood Market', grocery_id)
+    connection.close()

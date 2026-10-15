@@ -1,6 +1,7 @@
 """Scheduled transactions, Auto-Assign, money history, and focused budget views."""
 import calendar
 import json
+import sqlite3
 from datetime import date, datetime, timedelta, timezone
 
 from flask import abort, flash, redirect, render_template, request, session, url_for
@@ -139,6 +140,31 @@ def register_planning_features(app, db, current_budget, login_required, sidebar_
         db().execute("UPDATE payee_category_rules SET display_name=?,category_id=? WHERE id=?", (display_name[:200], category_id, rule_id))
         db().commit()
         flash("Payee rule updated.", "success")
+        return redirect(url_for("planning"))
+
+    @app.post("/payee-rules")
+    @login_required
+    def create_payee_rule():
+        budget = current_budget()
+        match_type = request.form.get("match_type")
+        match_value = " ".join(request.form.get("match_value", "").lower().split())
+        category_id = request.form.get("category_id", type=int)
+        rename_to = request.form.get("rename_to", "").strip() or None
+        category = db().execute("SELECT 1 FROM categories WHERE id=? AND budget_id=? AND parent_id IS NOT NULL AND kind='spending'",
+                                (category_id, budget["id"])).fetchone()
+        if match_type not in ("exact", "starts_with", "contains") or not match_value or not category:
+            flash("Choose a matching method, text, and valid category.", "error")
+        else:
+            key = f"rule:{match_type}:{match_value}"
+            try:
+                db().execute("""INSERT INTO payee_category_rules(
+                    budget_id,payee_key,display_name,category_id,match_type,match_value,rename_to)
+                    VALUES(?,?,?,?,?,?,?)""", (budget["id"], key, match_value, category_id, match_type, match_value, rename_to))
+                db().commit()
+                flash("Payee rule created. New imports and category suggestions will use it.", "success")
+            except sqlite3.IntegrityError:
+                db().rollback()
+                flash("A rule for that matching text already exists.", "error")
         return redirect(url_for("planning"))
 
     @app.post("/payee-rules/<int:rule_id>/delete")

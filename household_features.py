@@ -186,11 +186,21 @@ def register_features(app, db, current_budget, login_required, sidebar_accounts)
         cash_debt = sum(min(row['balance'], 0) for row in account_balances if row['type'] != 'credit')
         credit_debt = sum(min(row['balance'], 0) for row in account_balances if row['type'] == 'credit')
         net_worth = sum(row['balance'] for row in account_balances)
+        net_worth_history = {}
+        history_month = start.replace(day=1)
+        while history_month <= end:
+            next_history = (history_month.replace(day=28) + timedelta(days=4)).replace(day=1)
+            cutoff = min(next_history - timedelta(days=1), end)
+            value = db().execute('''SELECT COALESCE(SUM(a.starting_balance_cents+
+                COALESCE((SELECT SUM(t.amount_cents) FROM transactions t WHERE t.account_id=a.id AND t.occurred_on<=?),0)),0)
+                FROM accounts a WHERE a.budget_id=?''', (cutoff.isoformat(), ctx['budget']['id'])).fetchone()[0]
+            net_worth_history[history_month.strftime('%Y-%m')] = value
+            history_month = next_history
         return render_template('reports.html', **ctx, start=start, end=end, account_id=account_id,
                                income=income, spending=spending, refunds=refunds, breakdown=breakdown,
                                groups=dict(groups), monthly=monthly, net=income-spending+refunds,
                                account_balances=account_balances, assets=assets, cash_debt=cash_debt,
-                               credit_debt=credit_debt, net_worth=net_worth)
+                               credit_debt=credit_debt, net_worth=net_worth, net_worth_history=net_worth_history)
 
     @app.get('/backups')
     @owner_required

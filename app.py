@@ -13,6 +13,7 @@ from flask import Flask, abort, flash, g, redirect, render_template, request, se
 from werkzeug.security import check_password_hash, generate_password_hash
 from household_features import FEATURE_SCHEMA, register_features
 from planning_features import PLANNING_SCHEMA, log_money_move, register_planning_features
+from desktop_features import register_desktop_features
 
 
 def create_app(test_config=None):
@@ -83,6 +84,14 @@ def create_app(test_config=None):
             db().execute("UPDATE import_batches SET status='partial' WHERE status='imported'")
         if "import_undo_json" not in import_row_columns:
             db().execute("ALTER TABLE import_rows ADD COLUMN import_undo_json TEXT")
+        rule_columns = {row["name"] for row in db().execute("PRAGMA table_info(payee_category_rules)")}
+        if "match_type" not in rule_columns:
+            db().execute("ALTER TABLE payee_category_rules ADD COLUMN match_type TEXT NOT NULL DEFAULT 'exact'")
+        if "match_value" not in rule_columns:
+            db().execute("ALTER TABLE payee_category_rules ADD COLUMN match_value TEXT NOT NULL DEFAULT ''")
+            db().execute("UPDATE payee_category_rules SET match_value=payee_key WHERE match_value='' ")
+        if "rename_to" not in rule_columns:
+            db().execute("ALTER TABLE payee_category_rules ADD COLUMN rename_to TEXT")
         account_columns = {row["name"] for row in db().execute("PRAGMA table_info(accounts)")}
         if "closed" not in account_columns:
             db().execute("ALTER TABLE accounts ADD COLUMN closed INTEGER NOT NULL DEFAULT 0")
@@ -179,10 +188,24 @@ def create_app(test_config=None):
         if not category_id or not payee.strip():
             return
         db().execute(
-            """INSERT INTO payee_category_rules(budget_id,payee_key,display_name,category_id) VALUES(?,?,?,?)
+            """INSERT INTO payee_category_rules(budget_id,payee_key,display_name,category_id,match_type,match_value) VALUES(?,?,?,?,'exact',?)
                ON CONFLICT(budget_id,payee_key) DO UPDATE SET display_name=excluded.display_name,category_id=excluded.category_id""",
-            (budget_id, " ".join(payee.lower().split()), payee.strip(), category_id),
+            (budget_id, " ".join(payee.lower().split()), payee.strip(), category_id, " ".join(payee.lower().split())),
         )
+
+    def matching_payee_rule(budget_id, payee):
+        normalized = " ".join(payee.lower().split())
+        rules = db().execute("""SELECT r.*,c.name category_name,p.name parent_name FROM payee_category_rules r
+            JOIN categories c ON c.id=r.category_id LEFT JOIN categories p ON p.id=c.parent_id
+            WHERE r.budget_id=? ORDER BY CASE r.match_type WHEN 'exact' THEN 0 WHEN 'starts_with' THEN 1 ELSE 2 END,
+            length(r.match_value) DESC,r.id""", (budget_id,)).fetchall()
+        for rule in rules:
+            value = rule["match_value"] or rule["payee_key"]
+            if (rule["match_type"] == "exact" and normalized == value
+                or rule["match_type"] == "starts_with" and normalized.startswith(value)
+                or rule["match_type"] == "contains" and value in normalized):
+                return rule
+        return None
 
     def selected_month(value):
         try:
@@ -783,6 +806,9 @@ def create_app(test_config=None):
         ).fetchall()
         rows = [dict(row) for row in raw_rows]
         for row in rows:
+            rule = matching_payee_rule(budget["id"], row["payee"])
+            if rule:
+                row["suggested_category_id"], row["suggested_category_name"], row["suggested_parent_name"] = rule["category_id"], rule["category_name"], rule["parent_name"]
             candidates = [candidate for candidate in rows if candidate["id"] != row["id"]
                           and candidate["account_id"] != row["account_id"]
                           and candidate["amount_cents"] == -row["amount_cents"]
@@ -1007,8 +1033,19 @@ def create_app(test_config=None):
         for candidate in pending_rows:
             pending_by_amount.setdefault(candidate["amount_cents"], []).append(dict(candidate))
         rows = []
+        duplicate_matches = []
         for raw in raw_rows:
             row = dict(raw)
+            rule = matching_payee_rule(budget["id"], row["payee"])
+            if rule:
+                row["suggested_category_id"], row["suggested_category_name"], row["suggested_parent_name"] = rule["category_id"], rule["category_name"], rule["parent_name"]
+                row["suggested_rename"] = rule["rename_to"]
+            if row["duplicate"]:
+                row["duplicate_match"] = db().execute("""SELECT t.id,t.occurred_on,t.payee,t.amount_cents,t.cleared
+                    FROM transactions t WHERE t.account_id=? AND t.occurred_on=? AND t.amount_cents=?
+                    AND lower(t.payee)=lower(?) ORDER BY t.id LIMIT 1""",
+                    (batch["account_id"], row["occurred_on"], row["amount_cents"], row["payee"])).fetchone()
+                duplicate_matches.append(row)
             candidates = [candidate for candidate in transfers_by_amount.get(-row["amount_cents"], [])
                           if abs((date.fromisoformat(candidate["occurred_on"]) - date.fromisoformat(row["occurred_on"])).days) <= 3]
             candidates.sort(key=lambda candidate: (0 if "credit" in (batch["account_type"], candidate["account_type"]) else 1,
@@ -1043,6 +1080,7 @@ def create_app(test_config=None):
                                          (budget["id"], batch["account_id"])).fetchall()
         return render_template("import_review.html", budget=budget, accounts=sidebar_accounts(budget["id"]), batch=batch,
                                rows=rows, categories=categories, transfer_accounts=transfer_accounts, last_reconciliation=last_reconciliation,
+                               duplicate_matches=duplicate_matches,
                                active_view="imports", active_account_id=None)
 
     def import_transfer_match(budget_id, source_account_id, occurred_on, amount_cents, match_id):
@@ -1162,6 +1200,8 @@ def create_app(test_config=None):
             if category_id and not valid:
                 abort(400, "Invalid category")
             ready_to_assign = 1 if choice == "ready_to_assign" and row["amount_cents"] > 0 else 0
+            matched_rule = matching_payee_rule(budget["id"], row["payee"])
+            imported_payee_name = matched_rule["rename_to"] if matched_rule and matched_rule["rename_to"] else row["payee"]
             # A categorized statement row represents a posted bank transaction. Keep
             # uncategorized rows uncleared so they remain visibly pending review.
             imported_cleared = 1 if choice else 0
@@ -1200,10 +1240,10 @@ def create_app(test_config=None):
                 created_ids.append(cursor.lastrowid)
             else:
                 cursor = db().execute("INSERT INTO transactions(account_id,category_id,occurred_on,payee,memo,amount_cents,cleared,ready_to_assign) VALUES(?,?,?,?,?,?,?,?)",
-                                      (batch["account_id"], category_id if valid else None, row["occurred_on"], row["payee"], row["memo"], row["amount_cents"], imported_cleared, ready_to_assign))
+                                      (batch["account_id"], category_id if valid else None, row["occurred_on"], imported_payee_name, row["memo"], row["amount_cents"], imported_cleared, ready_to_assign))
                 created_ids.append(cursor.lastrowid)
             if valid:
-                remember_payee_category(budget["id"], row["payee"], category_id)
+                remember_payee_category(budget["id"], imported_payee_name, category_id)
             db().execute("UPDATE import_rows SET imported=1,review_selected=0,review_category=? WHERE id=?", (choice, row["id"]))
             record_import_undo(row["id"], created_ids, updated_transactions)
             imported += 1
@@ -1858,6 +1898,7 @@ def create_app(test_config=None):
     app.get_db = db
     register_features(app, db, current_budget, login_required, sidebar_accounts)
     register_planning_features(app, db, current_budget, login_required, sidebar_accounts, money, target_metrics, rebuild_credit_activity)
+    register_desktop_features(app, db, current_budget, login_required, sidebar_accounts)
     return app
 
 
@@ -1879,7 +1920,7 @@ CREATE TABLE IF NOT EXISTS category_activity(id INTEGER PRIMARY KEY, category_id
 CREATE TABLE IF NOT EXISTS transaction_splits(id INTEGER PRIMARY KEY, transaction_id INTEGER NOT NULL REFERENCES transactions(id), category_id INTEGER NOT NULL REFERENCES categories(id), memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS import_batches(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), account_id INTEGER NOT NULL REFERENCES accounts(id), filename TEXT NOT NULL, headers_json TEXT NOT NULL, rows_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'mapping', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS import_rows(id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE, occurred_on TEXT NOT NULL, payee TEXT NOT NULL, memo TEXT NOT NULL DEFAULT '', amount_cents INTEGER NOT NULL, review_selected INTEGER, review_category TEXT, imported INTEGER NOT NULL DEFAULT 0, import_undo_json TEXT);
-CREATE TABLE IF NOT EXISTS payee_category_rules(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), payee_key TEXT NOT NULL, display_name TEXT NOT NULL, category_id INTEGER NOT NULL REFERENCES categories(id), UNIQUE(budget_id,payee_key));
+CREATE TABLE IF NOT EXISTS payee_category_rules(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), payee_key TEXT NOT NULL, display_name TEXT NOT NULL, category_id INTEGER NOT NULL REFERENCES categories(id), match_type TEXT NOT NULL DEFAULT 'exact', match_value TEXT NOT NULL DEFAULT '', rename_to TEXT, UNIQUE(budget_id,payee_key));
 CREATE TABLE IF NOT EXISTS category_targets(id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL UNIQUE REFERENCES categories(id) ON DELETE CASCADE, target_type TEXT NOT NULL, amount_cents INTEGER NOT NULL, target_date TEXT, due_day INTEGER);
 CREATE TABLE IF NOT EXISTS saved_import_mappings(id INTEGER PRIMARY KEY, budget_id INTEGER NOT NULL REFERENCES budgets(id), account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL, header_signature TEXT NOT NULL, headers_json TEXT NOT NULL, mapping_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(account_id,header_signature));
 """

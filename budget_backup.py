@@ -55,6 +55,13 @@ def normalize(payload):
             for row in import_rows:
                 if isinstance(row, dict) and 'import_undo_json' not in row:
                     row['import_undo_json'] = None
+        rules = payload['tables'].get('payee_category_rules')
+        if isinstance(rules, list):
+            for row in rules:
+                if isinstance(row, dict) and 'match_type' not in row:
+                    row['match_type'] = 'exact'
+                    row['match_value'] = row.get('payee_key', '')
+                    row['rename_to'] = None
     return payload
 
 
@@ -141,6 +148,8 @@ def validate(connection, payload):
             if table == 'saved_import_mappings':
                 if not isinstance(json.loads(row['headers_json']), list) or not isinstance(json.loads(row['mapping_json']), dict):
                     raise ValueError('Invalid saved mapping.')
+            if table == 'payee_category_rules' and (row['match_type'] not in ('exact', 'starts_with', 'contains') or not row['match_value']):
+                raise ValueError('Invalid payee rule.')
             if table == 'scheduled_transactions':
                 if row['frequency'] not in ('weekly', 'biweekly', 'monthly') or row['amount_cents'] == 0 or row['active'] not in (0, 1):
                     raise ValueError('Invalid scheduled transaction.')
