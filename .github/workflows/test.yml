@@ -1,0 +1,45 @@
+name: Validate purchase goal integration
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+      - name: Verify bind storage, login and goal links after recreation
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t greatgatsby-budget-ci .
+          mkdir ci-data
+          chmod 777 ci-data
+          trap 'docker rm -f ggb-ci >/dev/null 2>&1 || true' EXIT
+          start_app() {
+            docker run -d --name ggb-ci "$@" -p 127.0.0.1:18081:8000 -v "$PWD/ci-data:/data:rw" -e APP_SECRET_KEY=synthetic-ci-secret -e GOALS_BASE_URL=http://goals:3000 greatgatsby-budget-ci
+            for attempt in {1..30}; do
+              if curl -fsS http://127.0.0.1:18081/health; then return; fi
+              sleep 1
+            done
+            docker logs ggb-ci
+            return 1
+          }
+          start_app
+          test "$(docker exec ggb-ci id -u)" != 0
+          docker cp tests/container_goals_check.py ggb-ci:/tmp/goals_check.py
+          docker exec -e PYTHONPATH=/app ggb-ci python /tmp/goals_check.py seed
+          docker rm -f ggb-ci
+          start_app
+          docker cp tests/container_goals_check.py ggb-ci:/tmp/goals_check.py
+          docker exec -e PYTHONPATH=/app ggb-ci python /tmp/goals_check.py verify
+          docker rm -f ggb-ci
+          start_app --user 0
+          test "$(docker exec ggb-ci stat -c %u /proc/1)" != 0
+          docker cp tests/container_goals_check.py ggb-ci:/tmp/goals_check.py
+          docker exec -e PYTHONPATH=/app ggb-ci python /tmp/goals_check.py verify

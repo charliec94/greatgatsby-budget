@@ -1,0 +1,17 @@
+{% extends 'base.html' %}{% block title %}Pull from Goals · GreatGatsby Budget{% endblock %}{% block body %}
+<div class="app-shell">{% include '_sidebar.html' %}<main class="workspace feature-page">
+<header><div><p class="eyebrow">PURCHASE PLANNING</p><h1>Pull from Goals</h1><p>Bring purchase savings targets into an Imported category group.</p></div></header>
+{% for category,message in get_flashed_messages(with_categories=true) %}<div role="status" class="flash {{category}}">{{message}}</div>{% endfor %}
+<section class="panel feature-card"><h2>Choose what to save toward</h2>
+<p>Only active or someday purchase goals with Savings tracking, a positive amount, and matching currency ({{budget.currency}}) are included. Set the unit to {{'$ or USD' if budget.currency=='USD' else budget.currency}} in Goals. Completed goals and other tracking methods are skipped.</p>
+<p>This copies names, target amounts, and deadlines. Your Budget balance determines savings progress. Goals progress, priorities, and tasks stay in Goals. No money is assigned or moved.</p>
+{% if configured %}<form method="post" action="{{url_for('goals_preview')}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><button>Pull from Goals — preview</button></form>
+{% else %}<p>Connection is not configured. Set GOALS_BASE_URL on the Budget container to the Goals app address reachable from that container, then recreate Budget. Example: http://YOUR-NAS-IP:3082. Do not use localhost unless both apps share a network namespace.</p>{% endif %}
+</section>
+{% if preview %}<section class="panel feature-card"><h2>Review purchase targets</h2><p>{{preview.rows|length}} eligible goals; {{preview.skipped}} skipped. Nothing has been imported yet. Preview expires in 15 minutes. Only checked goals will be applied.</p><p>Existing linked names, amounts, and deadlines will be overwritten with the values below. Current money assignments and transactions stay unchanged. Due dates in the past are retained and may require immediate funding.</p>
+{% if preview.rows %}<form method="post" action="{{url_for('goals_apply')}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input type="hidden" name="preview_token" value="{{preview_token}}">
+{% for row in preview.rows %}<fieldset><legend><label><input type="checkbox" name="goal_id" value="{{row.goal_id}}"> {{row.action}}: {{row.name}}</label></legend>
+<p>{{row.status|title}} · {{budget.currency}} {{'{:,.2f}'.format(row.amount/100)}} · {{'Savings by '~row.due if row.due else 'Savings balance (no deadline)'}}</p>
+{% if row.before %}<p>Currently: {{row.before.name}} · {{budget.currency}} {{'{:,.2f}'.format((row.before.amount_cents or 0)/100)}} · {{row.before.target_type or 'No target'}} · {{row.before.target_date or 'No deadline'}}</p>{% endif %}</fieldset>{% endfor %}
+<button>Apply selected targets</button></form>{% else %}<p>No eligible purchases. In Goals, create a Purchase with Savings tracking and a target amount, then pull again.</p>{% endif %}</section>{% endif %}
+</main></div>{% endblock %}

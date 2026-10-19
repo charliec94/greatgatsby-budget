@@ -30,4 +30,5 @@
   <Config Name="Appdata" Target="/data" Default="/mnt/user/appdata/greatgatsby-budget" Mode="rw" Description="Persistent database, backups, and Tailscale state. This is a Path mapping." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/greatgatsby-budget</Config>
   <Config Name="App secret key" Target="APP_SECRET_KEY" Default="" Mode="" Description="Long random secret used for login sessions" Type="Variable" Display="always" Required="true" Mask="true"/>
   <Config Name="Public base URL" Target="APP_BASE_URL" Default="" Mode="" Description="Optional private Tailscale URL used in invitation links" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Goals app URL" Target="GOALS_BASE_URL" Default="" Mode="" Description="Optional Goals HTTP(S) origin reachable from Budget, e.g. http://NAS-IP:3082. Enables owner-only purchase target pulls." Type="Variable" Display="advanced" Required="false" Mask="false"/>
 </Container>

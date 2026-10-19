@@ -14,6 +14,7 @@ COPY household_features.py ./
 COPY budget_backup.py ./
 COPY planning_features.py ./
 COPY desktop_features.py ./
+COPY goals_features.py ./
 COPY templates ./templates
 COPY static ./static
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
