@@ -13,6 +13,7 @@ from flask import Flask, abort, flash, g, redirect, render_template, request, se
 from werkzeug.security import check_password_hash, generate_password_hash
 from household_features import FEATURE_SCHEMA, register_features
 from planning_features import PLANNING_SCHEMA, log_money_move, register_planning_features
+from goals_features import GOALS_SCHEMA, register_goals_features
 from desktop_features import register_desktop_features
 
 
@@ -46,6 +47,7 @@ def create_app(test_config=None):
         db().executescript(SCHEMA)
         db().executescript(FEATURE_SCHEMA)
         db().executescript(PLANNING_SCHEMA)
+        db().executescript(GOALS_SCHEMA)
         needs_credit_rebuild = False
         columns = {row["name"] for row in db().execute("PRAGMA table_info(categories)")}
         if "hidden" not in columns:
@@ -1899,6 +1901,7 @@ def create_app(test_config=None):
     register_features(app, db, current_budget, login_required, sidebar_accounts)
     register_planning_features(app, db, current_budget, login_required, sidebar_accounts, money, target_metrics, rebuild_credit_activity)
     register_desktop_features(app, db, current_budget, login_required, sidebar_accounts)
+    register_goals_features(app, db, current_budget, login_required, sidebar_accounts)
     return app
 
 

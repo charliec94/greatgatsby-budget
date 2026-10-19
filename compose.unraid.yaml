@@ -10,6 +10,7 @@ services:
     environment:
       APP_DATABASE: /data/greatgatsby.db
       APP_SECRET_KEY: ${APP_SECRET_KEY:?Set APP_SECRET_KEY before starting}
+      GOALS_BASE_URL: ${GOALS_BASE_URL:-}
       APP_BASE_URL: ${APP_BASE_URL:-}
       SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
       SMTP_PORT: ${SMTP_PORT:-587}
